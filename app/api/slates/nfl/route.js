@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 
-const MLB_KEY = process.env.SPORTSDATA_MLB_KEY
+const NFL_KEY = process.env.SPORTSDATA_NFL_KEY
 
 export async function GET(request) {
     try {

@@ -32,6 +32,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+.env.local
+.env*.local
+# .env.example has no real secrets and is meant to be committed as a template —
+# without this, the broad ".env*" rule above would silently gitignore it too
+!.env.example
 
 # vercel
 .vercel
@@ -39,3 +44,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python optimizer service
+optimizer-service/__pycache__/
+optimizer-service/*.pyc
+*.pyc
+__pycache__/

@@ -10,8 +10,15 @@ export default function Optimizer() {
     const [players, setPlayers] = useState([])
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState(null)
+    const [optimizerStatus, setOptimizerStatus] = useState('unknown')
     const [posFilter, setPosFilter] = useState('ALL')
     const [search, setSearch] = useState('')
+    // Separate from posFilter/search above — those drive the main player table;
+    // the Stack Builder panel has its own tabs/search box and was wrongly wired
+    // to share that state (so its tabs both did nothing to its own list AND
+    // silently changed the main table's filter behind the scenes).
+    const [stackBuilderPosFilter, setStackBuilderPosFilter] = useState('ALL')
+    const [stackBuilderSearch, setStackBuilderSearch] = useState('')
     const [sortBy, setSortBy] = useState('OperatorSalary')
     const [sortDir, setSortDir] = useState('desc')
     const [lineups, setLineups] = useState([[]])
@@ -24,12 +31,13 @@ export default function Optimizer() {
     const [stackTeam, setStackTeam] = useState(null)
     const [fillPool, setFillPool] = useState([])
     const [showGameFilters, setShowGameFilters] = useState(false)
-    const [gameFiltersTab, setGameFiltersTab] = useState('rules')
+    const [gameFiltersTab, setGameFiltersTab] = useState('stacks')
+    const [assignModalPlayer, setAssignModalPlayer] = useState(null)
     const [slateSource, setSlateSource] = useState('live')
     const [manualPlayers, setManualPlayers] = useState([])
     const [manualSlateInfo, setManualSlateInfo] = useState(null)
     const [showSlateUpload, setShowSlateUpload] = useState(false)
-    const [stackRules, setStackRules] = useState({
+    const [legacyRules, setLegacyRules] = useState({
         minFromSameTeam: 0,
         maxFromSameTeam: 5,
         lockedPlayers: [],
@@ -73,6 +81,23 @@ export default function Optimizer() {
     const [showSlateNotes, setShowSlateNotes] = useState(false)
     const [notesSaved, setNotesSaved] = useState(false)
 
+    // Multi-stack builder state
+    const [multiStackRules, setMultiStackRules] = useState([])
+    const [pitcherPool, setPitcherPool] = useState([])
+    const [commonPool, setCommonPool] = useState([])
+    const [globalExposureCaps, setGlobalExposureCaps] = useState({})
+    const [globalExposureActual, setGlobalExposureActual] = useState({})
+    const [allGeneratedLineups, setAllGeneratedLineups] = useState([])
+    const [salaryMin, setSalaryMin] = useState('49500')
+    const [salaryMax, setSalaryMax] = useState('50000')
+    const [generatingProgress, setGeneratingProgress] = useState(null)
+    const [stackModalPlayer, setStackModalPlayer] = useState(null)
+    const [showStackModal, setShowStackModal] = useState(false)
+    const [aiSuggestions, setAiSuggestions] = useState(null)
+    const [aiSuggestLoading, setAiSuggestLoading] = useState(false)
+    const [activeStackFilter, setActiveStackFilter] = useState('all')
+    const [showStackBuilder, setShowStackBuilder] = useState(false)
+
     const [selectedDate, setSelectedDate] = useState(() => {
         const today = new Date()
         const ET = new Date(today.toLocaleString('en-US', { timeZone: 'America/New_York' }))
@@ -88,7 +113,7 @@ export default function Optimizer() {
     const POSITIONS = {
         mlb: ['ALL', 'P', 'C', '1B', '2B', '3B', 'SS', 'OF'],
         nba: ['ALL', 'PG', 'SG', 'SF', 'PF', 'C'],
-        nfl: ['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'DST'],
+        nfl: ['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'DST', 'DEF'],
     }
 
     const LINEUP_SLOTS = {
@@ -102,7 +127,7 @@ export default function Optimizer() {
         },
         nfl: {
             draftkings: ['QB', 'RB', 'RB', 'WR', 'WR', 'WR', 'TE', 'FLEX', 'DST'],
-            fanduel: ['QB', 'RB', 'RB', 'WR', 'WR', 'WR', 'TE', 'FLEX', 'K'],
+            fanduel: ['QB', 'RB', 'RB', 'WR', 'WR', 'WR', 'TE', 'K', 'DEF'],
         },
     }
 
@@ -167,6 +192,19 @@ export default function Optimizer() {
 
     // Restore state on first mount only
     useEffect(() => {
+        // Wake up optimizer service on page load (Render free-tier services
+        // sleep after inactivity and take a while to spin back up)
+        fetch('/api/keepalive')
+            .then(r => r.json())
+            .then(data => {
+                const status = data.services?.optimizer?.status
+                setOptimizerStatus(status || 'unknown')
+                if (status === 'awake') {
+                    setTimeout(() => setOptimizerStatus('unknown'), 3000)
+                }
+            })
+            .catch(() => setOptimizerStatus('unknown'))
+
         const wasRestored = restoreStateFromSession()
         if (!wasRestored) {
             fetchSlates()
@@ -184,6 +222,31 @@ export default function Optimizer() {
         }
     }, [sport, platform, selectedDate, slateSource])
 
+    // Sync salary range defaults when sport/platform changes, but not on first mount
+    // (so restored session state isn't clobbered back to defaults)
+    useEffect(() => {
+        if (isFirstMount) return
+        let min = '49500', max = '50000'
+        if (sport === 'nfl' && platform === 'fanduel') {
+            min = '59000'; max = '60000'
+        } else if (sport === 'nfl') {
+            min = '49500'; max = '50000'
+        }
+        setTeamSalaryMin(min)
+        setTeamSalaryMax(max)
+        setSalaryMin(min)
+        setSalaryMax(max)
+    }, [sport, platform])
+
+    // Sync players from manualPlayers when slate source is manual
+    useEffect(() => {
+        if (slateSource === 'manual' && manualPlayers.length > 0 && players.length === 0) {
+            setPlayers(manualPlayers)
+            setError(null)
+            setLoading(false)
+        }
+    }, [slateSource, manualPlayers])
+
     // Auto-save whenever important state changes
     useEffect(() => {
         if (players.length > 0 || lineups.some(l => l?.some(p => p))) {
@@ -192,7 +255,7 @@ export default function Optimizer() {
     }, [
         lineups,
         stackTeam,
-        stackRules,
+        multiStackRules,
         fillPool,
         teamSalaryMin,
         teamSalaryMax,
@@ -205,6 +268,17 @@ export default function Optimizer() {
         posFilter,
         stackExposures,
     ])
+
+    // Show a generation error longer when it looks like the Render-hosted
+    // optimizer was cold-starting (so the user has time to read the retry
+    // guidance) than for an ordinary validation error.
+    const setGenerationError = (errMsg) => {
+        setError(errMsg)
+        const isWakingUp = errMsg.includes('waking up') ||
+            errMsg.includes('timed out') ||
+            errMsg.includes('unavailable')
+        setTimeout(() => setError(null), isWakingUp ? 8000 : 4000)
+    }
 
     const fetchSlates = async () => {
         setLoading(true)
@@ -245,6 +319,53 @@ export default function Optimizer() {
         setLineup([])
     }
 
+    // Switching sports means an entirely different player pool/ID space, so
+    // every rule keyed by SlatePlayerID (locks, pools, exposures, projections)
+    // has to be cleared or it'll silently apply to the wrong sport's players.
+    const handleSportChange = (newSport) => {
+        if (newSport === sport) return
+        setSport(newSport)
+        setPlayers([])
+        setManualPlayers([])
+        setManualSlateInfo(null)
+        setSelectedSlate(null)
+        setSlates([])
+        setLineups([new Array(LINEUP_SLOTS[newSport][platform].length).fill(null)])
+        setActiveLineup(0)
+        setLineupCount(1)
+        setLineupReasonings([])
+        setMultiStackRules([])
+        setAllGeneratedLineups([])
+        setPitcherPool([])
+        setCommonPool([])
+        setFillPool([])
+        setStackExposures({})
+        setStackTeam(null)
+        setGlobalExposureCaps({})
+        setGlobalExposureActual({})
+        setLegacyRules({ minFromSameTeam: 0, maxFromSameTeam: 5, lockedPlayers: [], excludedPlayers: [] })
+        setCustomProjections({})
+        setCustomOwnership({})
+        setImportedProjections({})
+        setImportStatus(null)
+        setGameFilter(null)
+        setPosFilter('ALL')
+        setStackBuilderPosFilter('ALL')
+        setStackBuilderSearch('')
+        setAiAnalysis(null)
+        setAiSuggestions(null)
+        setError(null)
+
+        // The current SportsDataIO plan doesn't include live NFL slates — send
+        // straight to manual upload instead of an empty/failed live fetch.
+        if (newSport === 'nfl') {
+            setSlateSource('manual')
+            setShowSlateUpload(true)
+        } else {
+            setSlateSource('live')
+        }
+    }
+
     const formatGameTime = (dateStr) => {
         if (!dateStr) return ''
         try {
@@ -272,21 +393,39 @@ export default function Optimizer() {
     }
     const confirmedStarters = getConfirmedStarters()
     const isConfirmedStarter = (player) => {
-        if (slateSource === 'manual') return player.IsStartingPitcher === true
-        return confirmedStarters.has(player.PlayerID)
+        // Manual slate: confirmedStarters is only ever populated from live
+        // SportsDataIO probable-pitcher data, so it's always empty here — trust
+        // the CSV instead of hiding every manually-uploaded pitcher.
+        if (slateSource === 'manual') return true
+        if (player.IsStartingPitcher === true) return true
+        return confirmedStarters.has(player.PlayerID) || confirmedStarters.has(player.SlatePlayerID)
     }
 
     // Filter and sort — uses correct SportsDataIO field names
     const filteredPlayers = players
-        .filter(p => !gameFilter || p.SlateGameID === gameFilter)
         .filter(p => {
-            if (playerTab === 'excluded') return stackRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)
-            if (playerTab === 'liked') return likedPlayers.find(lp => lp.SlatePlayerID === p.SlatePlayerID)
-            if (stackRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)) return false
+            if (!gameFilter) return true
+            if (gameFilter.type === 'team') return p.Team === gameFilter.team
+            if (gameFilter.type === 'game') return p.SlateGameID === gameFilter.gameId
             return true
         })
         .filter(p => {
-            if (p.OperatorPosition === 'SP' || p.OperatorPosition === 'RP') return isConfirmedStarter(p)
+            if (playerTab === 'excluded') return legacyRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)
+            if (playerTab === 'liked') return likedPlayers.find(lp => lp.SlatePlayerID === p.SlatePlayerID)
+            if (legacyRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)) return false
+            return true
+        })
+        .filter(p => {
+            const isPitcher = p.OperatorPosition === 'SP' ||
+                p.OperatorPosition === 'RP' ||
+                p.OperatorPosition === 'P' ||
+                (p.OperatorRosterSlots || []).includes('P')
+            // Only live slates have real confirmed-starter data to filter by —
+            // manual slates always pass through (isConfirmedStarter already
+            // returns true for slateSource === 'manual', kept explicit here too)
+            if (isPitcher && slateSource === 'live') {
+                return isConfirmedStarter(p)
+            }
             return true
         })
         .filter(p => {
@@ -296,6 +435,13 @@ export default function Optimizer() {
                     p.OperatorPosition === 'RP' ||
                     p.OperatorPosition === 'P' ||
                     (p.OperatorRosterSlots || []).includes('P')
+            }
+            // NFL defense: DST/DEF are the same position under different platform labels
+            if (posFilter === 'DST' || posFilter === 'DEF') {
+                return p.OperatorPosition === 'DST' ||
+                    p.OperatorPosition === 'DEF' ||
+                    (p.OperatorRosterSlots || []).includes('DST') ||
+                    (p.OperatorRosterSlots || []).includes('DEF')
             }
             if (p.OperatorPosition?.includes('/')) {
                 return p.OperatorPosition.split('/').includes(posFilter)
@@ -341,14 +487,11 @@ export default function Optimizer() {
                     rosterSlots.includes('P')
             }
 
-            // FLEX slot for NFL accepts RB, WR, TE
+            // FLEX slot for NBA accepts any position; for NFL, RB/WR/TE only
             if (slot === 'FLEX') {
-                return ['RB', 'WR', 'TE'].includes(playerPos)
-            }
-
-            // FLEX slot for NBA accepts any position
-            if (slot === 'FLEX' && sport === 'nba') {
-                return true
+                if (sport === 'nba') return true
+                return ['RB', 'WR', 'TE'].includes(playerPos) ||
+                    (playerPos.includes('/') && playerPos.split('/').some(pp => ['RB', 'WR', 'TE'].includes(pp)))
             }
 
             // Multi-position players like "2B/3B" or "1B/OF"
@@ -707,6 +850,10 @@ export default function Optimizer() {
 
     const getInitials = (name) => {
         if (!name) return '??'
+        // NFL defenses are named like "Patriots D/ST" — use the team word, not "D"+"S"
+        if (name.includes('D/ST') || name.includes('DST')) {
+            return name.split(' ')[0].slice(0, 2).toUpperCase()
+        }
         return name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase()
     }
 
@@ -731,6 +878,8 @@ export default function Optimizer() {
             TE: 'rgba(251,146,60,0.15)',
             K: 'rgba(139,92,246,0.15)',
             DST: 'rgba(20,184,166,0.15)',
+            DEF: 'rgba(20,184,166,0.15)',
+            FLEX: 'rgba(251,146,60,0.1)',
         }
         return colors[pos] || 'rgba(138,155,190,0.15)'
     }
@@ -755,6 +904,8 @@ export default function Optimizer() {
             TE: '#FB923C',
             K: '#A78BFA',
             DST: '#2DD4BF',
+            DEF: '#2DD4BF',
+            FLEX: '#FB923C',
         }
         return colors[pos] || '#8A9BBE'
     }
@@ -762,10 +913,10 @@ export default function Optimizer() {
     const generateLineup = () => {
         const newLineup = new Array(slots.length).fill(null)
         const usedPlayerIDs = new Set()
-        const excludedIDs = new Set(stackRules.excludedPlayers.map(p => p.SlatePlayerID))
+        const excludedIDs = new Set(legacyRules.excludedPlayers.map(p => p.SlatePlayerID))
 
         // Step 1 — Place locked players first
-        stackRules.lockedPlayers.forEach(lockedPlayer => {
+        legacyRules.lockedPlayers.forEach(lockedPlayer => {
             const slotIndex = slots.findIndex((slot, i) => {
                 if (newLineup[i]) return false
                 const pos = lockedPlayer.OperatorPosition || ''
@@ -789,7 +940,7 @@ export default function Optimizer() {
         }, [])
 
         // Step 3 — Salary-aware fill: reserve $2000 per remaining slot
-        const lockedSalary = stackRules.lockedPlayers.reduce((sum, p) => sum + (p.OperatorSalary || 0), 0)
+        const lockedSalary = legacyRules.lockedPlayers.reduce((sum, p) => sum + (p.OperatorSalary || 0), 0)
         let remainingSalary = cap - lockedSalary
 
         emptySlots.forEach(({ slot, index }, i) => {
@@ -835,10 +986,10 @@ export default function Optimizer() {
     const generateRandomLineup = () => {
         const newLineup = new Array(slots.length).fill(null)
         const usedPlayerIDs = new Set()
-        const excludedIDs = new Set(stackRules.excludedPlayers.map(p => p.SlatePlayerID))
+        const excludedIDs = new Set(legacyRules.excludedPlayers.map(p => p.SlatePlayerID))
 
         // Place locked players first
-        stackRules.lockedPlayers.forEach(lockedPlayer => {
+        legacyRules.lockedPlayers.forEach(lockedPlayer => {
             const slotIndex = slots.findIndex((slot, i) => {
                 if (newLineup[i]) return false
                 const pos = lockedPlayer.OperatorPosition || ''
@@ -860,7 +1011,7 @@ export default function Optimizer() {
             return acc
         }, [])
 
-        const lockedSalary = stackRules.lockedPlayers.reduce((sum, p) => sum + (p.OperatorSalary || 0), 0)
+        const lockedSalary = legacyRules.lockedPlayers.reduce((sum, p) => sum + (p.OperatorSalary || 0), 0)
         let remainingSalary = cap - lockedSalary
 
         emptySlots.forEach(({ slot, index }, i) => {
@@ -973,16 +1124,12 @@ export default function Optimizer() {
                         operatorSalary: p.OperatorSalary,
                         operatorRosterSlots: p.OperatorRosterSlots,
                         team: p.Team,
-                        opponent: (() => {
-                            if (!selectedSlate?.DfsSlateGames) return p.Opponent || null
-                            const game = selectedSlate.DfsSlateGames.find(sg => sg.SlateGameID === p.SlateGameID)
-                            if (!game?.Game) return p.Opponent || null
-                            return p.Team === game.Game.AwayTeam ? game.Game.HomeTeam : game.Game.AwayTeam
-                        })(),
+                        opponent: getOpponent(p),
+                        opp: getOpponent(p),
                         projectedPoints: getProjection(p),
                         ownershipProjection: getEffectiveOwnership(p),
                         value: getValueScore(p),
-                        locked: !!stackRules.lockedPlayers.find(lp => lp.SlatePlayerID === p.SlatePlayerID),
+                        locked: !!legacyRules.lockedPlayers.find(lp => lp.SlatePlayerID === p.SlatePlayerID),
                     })),
                     ownershipTargets: Object.fromEntries(
                         Object.entries(customOwnership)
@@ -994,8 +1141,10 @@ export default function Optimizer() {
                     minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                     maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                     numLineups: lineupCount,
-                    lockedIds: stackRules.lockedPlayers.map(p => p.SlatePlayerID),
-                    excludedIds: stackRules.excludedPlayers.map(p => p.SlatePlayerID),
+                    lockedIds: legacyRules.lockedPlayers.map(p => p.SlatePlayerID),
+                    excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
+                    pitcherPoolIds: pitcherPool.map(p => p.SlatePlayerID),
+                    commonPoolIds: commonPool.map(p => p.SlatePlayerID),
                     playersPerTeamMax,
                     playersPerGameMax,
                     hittersVsPitcher,
@@ -1049,41 +1198,13 @@ export default function Optimizer() {
             const data = await res.json()
 
             if (!data.success) {
-                setError(data.error || 'Failed to generate lineups.')
-                setTimeout(() => setError(null), 4000)
+                setGenerationError(data.error || 'Failed to generate lineups.')
                 setLoading(false)
                 return
             }
 
             // Assign players to slots correctly
-            const properLineups = data.lineups.map(lu => {
-                const newLineup = new Array(slots.length).fill(null)
-                const usedIds = new Set()
-
-                slots.forEach((slot, slotIndex) => {
-                    const eligible = lu.players.filter(p => {
-                        if (usedIds.has(p.slatePlayerId)) return false
-                        const pos = p.operatorPosition || ''
-                        const rosterSlots = p.operatorRosterSlots || []
-                        if (slot === 'P') return pos === 'SP' || pos === 'RP' || pos === 'P' || rosterSlots.includes('P')
-                        if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos) || pos.split('/').some(p => ['RB', 'WR', 'TE'].includes(p))
-                        if (pos.includes('/')) return pos.split('/').includes(slot)
-                        if (rosterSlots.includes(slot)) return true
-                        return pos === slot
-                    })
-
-                    if (eligible.length > 0) {
-                        const pick = eligible[0]
-                        const fullPlayer = eligiblePool.find(ep => ep.SlatePlayerID === pick.slatePlayerId)
-                        if (fullPlayer) {
-                            newLineup[slotIndex] = fullPlayer
-                            usedIds.add(pick.slatePlayerId)
-                        }
-                    }
-                })
-
-                return newLineup
-            })
+            const properLineups = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
 
             const paddedLineups = Array.from(
                 { length: lineupCount },
@@ -1288,13 +1409,38 @@ export default function Optimizer() {
         const idx = (name) => headers.indexOf(name)
         const parsedPlayers = []
 
+        // NFL roster slots: skill positions are also FLEX-eligible; defense
+        // is listed as DST/DEF/D/ST depending on source, so accept both aliases
+        const getNflRosterSlots = (pos) => {
+            switch (pos.toUpperCase()) {
+                case 'QB': return ['QB']
+                case 'RB': return ['RB', 'FLEX']
+                case 'WR': return ['WR', 'FLEX']
+                case 'TE': return ['TE', 'FLEX']
+                case 'K': return ['K']
+                case 'DST':
+                case 'DEF':
+                case 'D/ST': return ['DST', 'DEF']
+                default: return [pos]
+            }
+        }
+
+        // Normalize DST/DEF/D/ST to DK's "DST" or FanDuel's "DEF" label
+        const normalizeNflPosition = (pos) => {
+            const upper = pos.toUpperCase()
+            if (['DST', 'DEF', 'D/ST'].includes(upper)) {
+                return platform === 'fanduel' ? 'DEF' : 'DST'
+            }
+            return upper
+        }
+
         lines.slice(1).forEach((line, i) => {
             if (!line.trim()) return
             const cols = line.split(',')
 
             const firstName = (cols[idx('first_name')] || '').trim()
             const lastName = (cols[idx('last_name')] || '').trim()
-            const fullName = `${firstName} ${lastName}`.trim()
+            let fullName = `${firstName} ${lastName}`.trim()
             const position = (cols[idx('position')] || '').trim().toUpperCase()
             const team = (cols[idx('team')] || '').trim().toUpperCase()
             const opp = (cols[idx('opp')] || '').trim().toUpperCase()
@@ -1308,15 +1454,35 @@ export default function Optimizer() {
             const spread = parseFloat(cols[idx('spread')]) || null
             const slate = (cols[idx('slate')] || '').trim()
             const gameDate = (cols[idx('game_date')] || '').trim()
-            const isPitcher = position === 'P' || position === 'SP' || position === 'RP'
-            const isStartingPitcher = (cols[idx('starting_pitcher')] || '').trim().toUpperCase() === 'YES'
+            // Sport is decided by the sport toggle, never guessed from a position
+            // string — auto-detection here previously misfired and swallowed MLB
+            // pitcher rows into NFL parsing.
+            const isNflSlate = sport === 'nfl'
+            const isDstRow = isNflSlate && ['DST', 'DEF', 'D/ST'].includes(position)
+            const isPitcher = !isNflSlate && (position === 'P' || position === 'SP' || position === 'RP')
+            // Some cheatsheets label starters explicitly as "SP" with no separate
+            // starting_pitcher column — treat that as sufficient on its own.
+            // This only decides the SP/RP display label — it does NOT gate
+            // inclusion (see IsStartingPitcher below / isConfirmedStarter).
+            const isStarterLabel = isPitcher && (
+                (cols[idx('starting_pitcher')] || '').trim().toUpperCase() === 'YES' ||
+                position === 'SP'
+            )
+
+            // DST rows often omit a player name — fall back to "{Team} D/ST"
+            if (isDstRow && !fullName) fullName = `${team} D/ST`
 
             if (!fullName || !salary) return
 
             let operatorPosition = position
-            if (position === 'P') operatorPosition = isStartingPitcher ? 'SP' : 'RP'
-
-            const rosterSlots = isPitcher ? ['P'] : [position]
+            let rosterSlots
+            if (isNflSlate) {
+                operatorPosition = normalizeNflPosition(position)
+                rosterSlots = getNflRosterSlots(position)
+            } else {
+                if (position === 'P') operatorPosition = isStarterLabel ? 'SP' : 'RP'
+                rosterSlots = isPitcher ? ['P'] : [position]
+            }
 
             parsedPlayers.push({
                 SlatePlayerID: 90000 + i,
@@ -1336,7 +1502,14 @@ export default function Optimizer() {
                 OverUnder: ou,
                 Spread: spread,
                 Opponent: opp,
-                IsStartingPitcher: isStartingPitcher,
+                // Manual slates are user-curated — trust every parsed pitcher row
+                // (SP or RP) instead of silently hiding relievers or anyone the
+                // starting_pitcher/position heuristic misclassifies. See
+                // isConfirmedStarter, which bypasses this check entirely for
+                // slateSource === 'manual' but still reads it as a fallback for
+                // live slates.
+                IsStartingPitcher: isPitcher,
+                IsNfl: isNflSlate,
                 SlateLabel: slate,
                 GameDate: gameDate,
                 RemovedByOperator: false,
@@ -1375,8 +1548,8 @@ export default function Optimizer() {
                 SlateID: 99999,
                 OperatorName: slateName,
                 NumberOfGames: gameCount,
-                SalaryCap: 50000,
-                SlateRosterSlots: ['P', 'P', 'C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF'],
+                SalaryCap: cap,
+                SlateRosterSlots: slots,
                 DfsSlateGames: games,
                 players: parsedPlayers
             }
@@ -1397,6 +1570,8 @@ export default function Optimizer() {
             setSlateSource('manual')
             setSelectedSlate(slateInfo)
             setPlayers(parsed)
+            setError(null)
+            setLoading(false)
             setLineups([new Array(slots.length).fill(null)])
             setActiveLineup(0)
             setShowSlateUpload(false)
@@ -1405,6 +1580,14 @@ export default function Optimizer() {
             setImportStatus(null)
 
             console.log(`Manual slate loaded: ${parsed.length} players, ${slateInfo.NumberOfGames} games`)
+
+            // Debug: confirm pitchers survived parsing. 0 here means parsing
+            // dropped them; a nonzero count that still doesn't show in the
+            // table means the filter (isConfirmedStarter/eligiblePool) is at fault.
+            const pitcherCount = parsed.filter(p =>
+                p.OperatorPosition === 'SP' || p.OperatorPosition === 'RP'
+            ).length
+            console.log(`Manual slate parsed: ${parsed.length} players (${pitcherCount} pitchers)`)
         }
         reader.readAsText(file)
     }
@@ -1421,12 +1604,12 @@ export default function Optimizer() {
             return
         }
 
-        const currentExcluded = stackRules.excludedPlayers
+        const currentExcluded = legacyRules.excludedPlayers
         const newExclusions = unprojected.filter(p =>
             !currentExcluded.find(ep => ep.SlatePlayerID === p.SlatePlayerID)
         )
 
-        setStackRules(prev => ({
+        setLegacyRules(prev => ({
             ...prev,
             excludedPlayers: [...prev.excludedPlayers, ...newExclusions]
         }))
@@ -1441,10 +1624,16 @@ export default function Optimizer() {
 
     const eligiblePool = players
         .filter(p => {
-            if (p.OperatorPosition === 'SP' || p.OperatorPosition === 'RP') {
+            const isPitcher = p.OperatorPosition === 'SP' ||
+                p.OperatorPosition === 'RP' ||
+                p.OperatorPosition === 'P' ||
+                (p.OperatorRosterSlots || []).includes('P')
+            // Manual slate or non-pitcher: always eligible (isConfirmedStarter
+            // already returns true for slateSource === 'manual', kept explicit here too)
+            if (isPitcher && slateSource === 'live') {
                 return isConfirmedStarter(p)
             }
-            if (stackRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)) return false
+            if (legacyRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)) return false
             if (!p.OperatorSalary || p.OperatorSalary === 0) return false
             if (p.RemovedByOperator === true) return false
             return true
@@ -1455,6 +1644,36 @@ export default function Optimizer() {
             return bVal - aVal
         })
     console.log('Eligible pool size:', eligiblePool.length)
+
+    // Stack Builder's own player pool list — filtered independently of the
+    // main table's posFilter/search so its tabs and search box actually affect
+    // the list they're drawn next to, instead of silently changing (or being
+    // silently ignored by) the main player table's filters.
+    const stackBuilderFilteredPlayers = eligiblePool.filter(p => {
+        if (stackBuilderPosFilter !== 'ALL') {
+            const pos = p.OperatorPosition || ''
+            if (stackBuilderPosFilter === 'P') {
+                if (!['SP', 'RP', 'P'].includes(pos) && !(p.OperatorRosterSlots || []).includes('P')) return false
+            } else if (stackBuilderPosFilter === 'DST' || stackBuilderPosFilter === 'DEF') {
+                if (pos !== 'DST' && pos !== 'DEF' &&
+                    !(p.OperatorRosterSlots || []).includes('DST') &&
+                    !(p.OperatorRosterSlots || []).includes('DEF')) return false
+            } else if (pos.includes('/')) {
+                if (!pos.split('/').includes(stackBuilderPosFilter)) return false
+            } else if (pos !== stackBuilderPosFilter) {
+                return false
+            }
+        }
+
+        if (stackBuilderSearch) {
+            const q = stackBuilderSearch.toLowerCase()
+            const name = (p.OperatorPlayerName || '').toLowerCase()
+            const team = (p.Team || '').toLowerCase()
+            if (!name.includes(q) && !team.includes(q)) return false
+        }
+
+        return true
+    })
     console.log('By position:', eligiblePool.reduce((acc, p) => {
         acc[p.OperatorPosition] = (acc[p.OperatorPosition] || 0) + 1
         return acc
@@ -1489,8 +1708,8 @@ export default function Optimizer() {
         console.log('Stack team:', stackTeam)
         console.log('Append count:', appendCount)
         console.log('Stack distribution:', appendStackDistribution)
-        console.log('Locked:', stackRules.lockedPlayers.map(p => p.OperatorPlayerName))
-        console.log('Excluded:', stackRules.excludedPlayers.map(p => p.OperatorPlayerName))
+        console.log('Locked:', legacyRules.lockedPlayers.map(p => p.OperatorPlayerName))
+        console.log('Excluded:', legacyRules.excludedPlayers.map(p => p.OperatorPlayerName))
         console.log('Fill pool:', fillPool.map(p => p.OperatorPlayerName))
 
         try {
@@ -1503,15 +1722,11 @@ export default function Optimizer() {
                     operatorSalary: p.OperatorSalary,
                     operatorRosterSlots: p.OperatorRosterSlots || [],
                     team: p.Team,
-                    opponent: (() => {
-                        if (!selectedSlate?.DfsSlateGames) return p.Opponent || null
-                        const game = selectedSlate.DfsSlateGames.find(sg => sg.SlateGameID === p.SlateGameID)
-                        if (!game?.Game) return p.Opponent || null
-                        return p.Team === game.Game.AwayTeam ? game.Game.HomeTeam : game.Game.AwayTeam
-                    })(),
+                    opponent: getOpponent(p),
+                    opp: getOpponent(p),
                     projectedPoints: getProjection(p),
                     ownershipProjection: getEffectiveOwnership(p),
-                    locked: !!stackRules.lockedPlayers.find(
+                    locked: !!legacyRules.lockedPlayers.find(
                         lp => lp.SlatePlayerID === p.SlatePlayerID
                     ),
                 })),
@@ -1525,8 +1740,10 @@ export default function Optimizer() {
                 minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                 maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                 numLineups: appendCount,
-                lockedIds: stackRules.lockedPlayers.map(p => p.SlatePlayerID),
-                excludedIds: stackRules.excludedPlayers.map(p => p.SlatePlayerID),
+                lockedIds: legacyRules.lockedPlayers.map(p => p.SlatePlayerID),
+                excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
+                pitcherPoolIds: pitcherPool.map(p => p.SlatePlayerID),
+                commonPoolIds: commonPool.map(p => p.SlatePlayerID),
                 fillPoolIds: fillPool.map(p => p.SlatePlayerID),
                 stackTeam: stackTeam || null,
                 stackSize: stackTeam ? 5 : 0,
@@ -1551,43 +1768,13 @@ export default function Optimizer() {
             console.log('Optimizer response:', data.success, 'lineups:', data.generated)
 
             if (!data.success) {
-                setError(data.error || 'Failed to generate lineups')
-                setTimeout(() => setError(null), 4000)
+                setGenerationError(data.error || 'Failed to generate lineups')
                 setAppending(false)
                 return
             }
 
             // Map returned players to full player objects
-            const newLineups = data.lineups.map(lu => {
-                const newLineup = new Array(slots.length).fill(null)
-                const usedIds = new Set()
-
-                slots.forEach((slot, slotIndex) => {
-                    const eligible = lu.players.filter(p => {
-                        if (usedIds.has(p.slatePlayerId)) return false
-                        const pos = p.operatorPosition || ''
-                        const rosterSlots = p.operatorRosterSlots || []
-                        if (slot === 'P') return pos === 'SP' || pos === 'RP' || pos === 'P' || rosterSlots.includes('P')
-                        if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos)
-                        if (pos.includes('/')) return pos.split('/').includes(slot)
-                        if (rosterSlots.includes(slot)) return true
-                        return pos === slot
-                    })
-
-                    if (eligible.length > 0) {
-                        const pick = eligible[0]
-                        const fullPlayer = eligiblePool.find(
-                            ep => ep.SlatePlayerID === pick.slatePlayerId
-                        )
-                        if (fullPlayer) {
-                            newLineup[slotIndex] = fullPlayer
-                            usedIds.add(pick.slatePlayerId)
-                        }
-                    }
-                })
-
-                return newLineup
-            })
+            const newLineups = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
 
             // Append to existing valid lineups
             const existingValid = lineups.filter(l => l && l.some(p => p !== null))
@@ -1697,7 +1884,7 @@ export default function Optimizer() {
                 lineupCount,
                 stackTeam,
                 stackExposures,
-                stackRules,
+                legacyRules,
                 fillPool,
                 teamSalaryMin,
                 teamSalaryMax,
@@ -1730,7 +1917,7 @@ export default function Optimizer() {
             if (state.selectedDate) setSelectedDate(state.selectedDate)
             if (state.stackTeam) setStackTeam(state.stackTeam)
             if (state.stackExposures) setStackExposures(state.stackExposures)
-            if (state.stackRules) setStackRules(state.stackRules)
+            if (state.legacyRules) setLegacyRules(state.legacyRules)
             if (state.fillPool) setFillPool(state.fillPool)
             if (state.teamSalaryMin) setTeamSalaryMin(state.teamSalaryMin)
             if (state.teamSalaryMax) setTeamSalaryMax(state.teamSalaryMax)
@@ -1817,8 +2004,10 @@ export default function Optimizer() {
                     stackTeam: stackTeam || null,
                     stackExposures,
                     fillPoolIds: fillPool.map(p => p.SlatePlayerID),
-                    lockedIds: stackRules.lockedPlayers.map(p => p.SlatePlayerID),
-                    excludedIds: stackRules.excludedPlayers.map(p => p.SlatePlayerID),
+                    lockedIds: legacyRules.lockedPlayers.map(p => p.SlatePlayerID),
+                    excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
+                    pitcherPoolIds: pitcherPool.map(p => p.SlatePlayerID),
+                    commonPoolIds: commonPool.map(p => p.SlatePlayerID),
                     playersPerTeamMax,
                     hittersVsPitcher,
                     sport,
@@ -2007,14 +2196,14 @@ export default function Optimizer() {
         })
         setFillPool(newFillPool)
 
-        const newExcluded = [...stackRules.excludedPlayers]
+        const newExcluded = [...legacyRules.excludedPlayers]
         aiAnalysis.global_avoid?.forEach(pa => {
             const player = findPlayerByName(pa.name)
             if (player && !newExcluded.find(p => p.SlatePlayerID === player.SlatePlayerID)) {
                 newExcluded.push(player)
             }
         })
-        setStackRules(prev => ({
+        setLegacyRules(prev => ({
             ...prev,
             excludedPlayers: newExcluded
         }))
@@ -2054,7 +2243,7 @@ export default function Optimizer() {
         })
         setFillPool(newFillPool)
 
-        const newExcluded = [...stackRules.excludedPlayers]
+        const newExcluded = [...legacyRules.excludedPlayers]
         aiAnalysis.players_to_avoid?.forEach(pa => {
             const player = findPlayerByName(pa.name)
             if (player && !newExcluded.find(
@@ -2064,7 +2253,7 @@ export default function Optimizer() {
                 appliedCount++
             }
         })
-        setStackRules(prev => ({
+        setLegacyRules(prev => ({
             ...prev,
             excludedPlayers: newExcluded
         }))
@@ -2072,136 +2261,510 @@ export default function Optimizer() {
         setError(null)
     }
 
+    // ─── Stack helper functions ──────────────────────────────────────────────
+    const addStack = (team, player) => {
+        // Normalize to the same lowercase payload shape used everywhere else a
+        // player gets locked into a stack (see getLockedId/getLockedName) —
+        // pushing the raw uppercase-keyed player object here was the same bug.
+        const lockedPayload = player ? {
+            slatePlayerId: player.SlatePlayerID,
+            operatorPlayerName: player.OperatorPlayerName,
+            operatorPosition: player.OperatorPosition,
+            operatorSalary: player.OperatorSalary,
+            team: player.Team,
+        } : null
+        const newStack = {
+            id: Date.now().toString(),
+            team: team || player?.Team || '',
+            lockedPlayers: lockedPayload ? [lockedPayload] : [],
+            lineupCount: 10,
+            minUniquePlayers: 2,
+            reasoning: '',
+            source: 'manual',
+            status: 'pending',
+            generatedLineups: [],
+        }
+        setMultiStackRules(prev => [...prev, newStack])
+        return newStack.id
+    }
+
+    const removeStack = (stackId) => setMultiStackRules(prev => prev.filter(s => s.id !== stackId))
+
+    const updateStack = (stackId, updates) =>
+        setMultiStackRules(prev => prev.map(s => s.id === stackId ? { ...s, ...updates } : s))
+
+    const addPlayerToStack = (stackId, player) =>
+        setMultiStackRules(prev => prev.map(s => {
+            if (s.id !== stackId) return s
+            if (s.lockedPlayers.find(p => getLockedId(p) === player.SlatePlayerID)) return s
+            // Normalize to the lowercase payload shape (matches the stack-assignment
+            // modal's convention, and pitcherPool/commonPool elsewhere) instead of
+            // pushing the raw uppercase-keyed player object — see getLockedId above.
+            const payload = {
+                slatePlayerId: player.SlatePlayerID,
+                operatorPlayerName: player.OperatorPlayerName,
+                operatorPosition: player.OperatorPosition,
+                operatorSalary: player.OperatorSalary,
+                team: player.Team,
+            }
+            return { ...s, team: s.team || player.Team, lockedPlayers: [...s.lockedPlayers, payload] }
+        }))
+
+    const removePlayerFromStack = (stackId, playerId) =>
+        setMultiStackRules(prev => prev.map(s => {
+            if (s.id !== stackId) return s
+            return { ...s, lockedPlayers: s.lockedPlayers.filter(p => getLockedId(p) !== playerId) }
+        }))
+
+    const addToPitcherPool = (player) => {
+        if (pitcherPool.find(p => p.SlatePlayerID === player.SlatePlayerID)) return
+        setPitcherPool(prev => [...prev, { ...player, maxExposurePct: 35, warning: null }])
+    }
+
+    const addToCommonPool = (player) => {
+        if (commonPool.find(p => p.SlatePlayerID === player.SlatePlayerID)) return
+        setCommonPool(prev => [...prev, { ...player, maxExposurePct: 50 }])
+    }
+    // ─── End Stack helper functions ──────────────────────────────────────────
+
+    // ─── Multi-Stack Builder helpers ────────────────────────────────────────
+    const getOpponent = (player) => {
+        if (!selectedSlate?.DfsSlateGames) return player.Opponent || null
+        const game = selectedSlate.DfsSlateGames.find(sg => sg.SlateGameID === player.SlateGameID)
+        if (!game?.Game) return player.Opponent || null
+        return player.Team === game.Game.AwayTeam ? game.Game.HomeTeam : game.Game.AwayTeam
+    }
+
+    const buildPlayerPayload = (p) => ({
+        slatePlayerId: p.SlatePlayerID,
+        slateGameId: p.SlateGameID,
+        operatorPlayerName: p.OperatorPlayerName,
+        operatorPosition: p.OperatorPosition,
+        operatorSalary: p.OperatorSalary,
+        operatorRosterSlots: p.OperatorRosterSlots || [],
+        team: p.Team,
+        opponent: getOpponent(p),
+        opp: getOpponent(p),
+        projectedPoints: getProjection(p),
+        ownershipProjection: getEffectiveOwnership(p),
+        value: getValueScore(p),
+        locked: false,
+    })
+
+    const mapLineupPlayersToSlots = (luPlayers, pool, slotList) => {
+        const newLineup = new Array(slotList.length).fill(null)
+        const usedIds = new Set()
+        slotList.forEach((slot, slotIndex) => {
+            const eligible = luPlayers.filter(p => {
+                if (usedIds.has(p.slatePlayerId)) return false
+                const pos = p.operatorPosition || ''
+                const rs = p.operatorRosterSlots || []
+                if (slot === 'P') return pos === 'SP' || pos === 'RP' || pos === 'P' || rs.includes('P')
+                if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos) || pos.split('/').some(part => ['RB', 'WR', 'TE'].includes(part))
+                if (pos.includes('/')) return pos.split('/').includes(slot)
+                if (rs.includes(slot)) return true
+                return pos === slot
+            })
+                // Deterministic order: same eligible set always yields the same pick,
+                // regardless of what order the backend returned lu.players in.
+                .sort((a, b) => (a.slatePlayerId ?? 0) - (b.slatePlayerId ?? 0))
+            if (eligible.length > 0) {
+                const pick = eligible[0]
+                const fullPlayer = pool.find(ep => ep.SlatePlayerID === pick.slatePlayerId)
+                if (fullPlayer) { newLineup[slotIndex] = fullPlayer; usedIds.add(pick.slatePlayerId) }
+            }
+        })
+        return newLineup
+    }
+
+    const isInPitcherPool = (p) => pitcherPool.some(pp => pp.slatePlayerId === p.SlatePlayerID)
+    const isInCommonPool = (p) => commonPool.some(cp => cp.slatePlayerId === p.SlatePlayerID)
+    // A stack rule's lockedPlayers array has historically mixed two shapes
+    // depending on which "add to stack" UI added the entry: addPlayerToStack
+    // pushed the raw player object (SlatePlayerID/OperatorPlayerName, uppercase),
+    // while the stack-assignment modal built its own payload (slatePlayerId/
+    // operatorPlayerName, lowercase). Reading only one casing silently dropped
+    // whichever half was added via the other path — which is exactly why
+    // lockedPlayerIds sent to the optimizer, and the locked-player chips in the
+    // UI, would go missing depending on how a player was locked. These
+    // accessors work regardless of which shape an entry has (including ones
+    // already saved in an existing browser session before this fix).
+    const getLockedId = (lp) => lp?.slatePlayerId ?? lp?.SlatePlayerID
+    const getLockedName = (lp) => lp?.operatorPlayerName ?? lp?.OperatorPlayerName
+    const getPlayerStacks = (p) => multiStackRules.filter(r => r.lockedPlayers.some(lp => getLockedId(lp) === p.SlatePlayerID))
+
+    const generateStack = async (stackId) => {
+        const stack = multiStackRules.find(s => s.id === stackId)
+        if (!stack) return
+
+        updateStack(stackId, { status: 'generating' })
+        setError(null)
+
+        console.log('Generating stack:', stack.team, 'Locked:', stack.lockedPlayers.map(p =>
+            `${getLockedName(p)}(${getLockedId(p)})`
+        ))
+
+        try {
+            const res = await fetch('/api/optimize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    players: eligiblePool.map(p => ({
+                        slatePlayerId: p.SlatePlayerID,
+                        slateGameId: p.SlateGameID,
+                        operatorPlayerName: p.OperatorPlayerName,
+                        operatorPosition: p.OperatorPosition,
+                        operatorSalary: p.OperatorSalary,
+                        operatorRosterSlots: p.OperatorRosterSlots || [],
+                        team: p.Team,
+                        opponent: getOpponent(p),
+                        opp: getOpponent(p),
+                        projectedPoints: parseFloat(getProjection(p)) || 0,
+                        ownershipProjection: parseFloat(getEffectiveOwnership(p)) || 0,
+                        locked: !!stack.lockedPlayers.find(lp => getLockedId(lp) === p.SlatePlayerID),
+                    })),
+                    slots,
+                    cap,
+                    minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
+                    maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
+                    numLineups: stack.lineupCount,
+                    lockedPlayerIds: stack.lockedPlayers.map(getLockedId),
+                    excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
+                    pitcherPoolIds: pitcherPool.length > 0 ? pitcherPool.map(p => p.SlatePlayerID) : [],
+                    commonPoolIds: commonPool.length > 0 ? commonPool.map(p => p.SlatePlayerID) : [],
+                    fillPoolIds: fillPool.map(p => p.SlatePlayerID),
+                    stackTeam: stack.team || null,
+                    stackTeamSize: 5,
+                    stackDistribution: Array(stack.lineupCount).fill(stack.team || null),
+                    playersPerTeamMax,
+                    playersPerGameMax,
+                    hittersVsPitcher,
+                    uniquePlayersPerLineup: stack.minUniquePlayers || 2,
+                    numberOfGames: selectedSlate?.NumberOfGames || 10,
+                    ownershipTargets: Object.fromEntries(
+                        Object.entries(customOwnership)
+                            .filter(([_, v]) => v !== '' && v !== undefined && parseFloat(v) > 0)
+                            .map(([id, pct]) => [String(parseInt(id)), parseFloat(pct)])
+                    ),
+                })
+            })
+
+            const data = await res.json()
+
+            if (!data.success) {
+                updateStack(stackId, { status: 'error', error: data.error || 'Failed to generate' })
+                return
+            }
+
+            const generatedLineups = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
+
+            updateStack(stackId, { status: 'generated', generatedLineups, error: null })
+
+            setLineups(prev => {
+                const existing = prev.filter(l => l && l.some(p => p !== null))
+                return [...existing, ...generatedLineups]
+            })
+            setLineupCount(prev => prev + generatedLineups.length)
+
+        } catch (err) {
+            console.error('Stack generation error:', err)
+            updateStack(stackId, { status: 'error', error: err.message || 'Network error' })
+        }
+    }
+
+    const generateSingleStack = async (ruleId) => {
+        const rule = multiStackRules.find(r => r.id === ruleId)
+        if (!rule || eligiblePool.length === 0) return
+        setMultiStackRules(prev => prev.map(r => r.id === ruleId ? { ...r, status: 'generating' } : r))
+        try {
+            const res = await fetch('/api/optimize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    players: eligiblePool.map(buildPlayerPayload),
+                    slots, cap,
+                    minSalary: parseInt(salaryMin) || 49500,
+                    maxSalary: parseInt(salaryMax) || 50000,
+                    numLineups: rule.lineupCount,
+                    minUniquePlayers: rule.minUniquePlayers || 2,
+                    lockedPlayerIds: rule.lockedPlayers.map(getLockedId),
+                    pitcherPoolIds: pitcherPool.map(p => p.slatePlayerId),
+                    commonPoolIds: commonPool.map(p => p.slatePlayerId),
+                    globalExposureCaps,
+                    globalExposureActual,
+                    totalLineupsSoFar: allGeneratedLineups.length,
+                    stackTeam: rule.team,
+                    stackTeamSize: 5,
+                    stackSize: 5,
+                    stackDistribution: Array(rule.lineupCount).fill(rule.team),
+                    numberOfGames: selectedSlate?.NumberOfGames || 10,
+                    playersPerTeamMax: 5,
+                    playersPerGameMax: 8,
+                    uniquePlayersPerLineup: rule.minUniquePlayers || 2,
+                })
+            })
+            const data = await res.json()
+            if (data.success) {
+                const mapped = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
+                setMultiStackRules(prev => prev.map(r => r.id === ruleId
+                    ? { ...r, status: 'generated', generatedLineups: mapped } : r))
+                setAllGeneratedLineups(prev => [
+                    ...prev.filter(l => l.stackId !== ruleId),
+                    ...mapped.map(lu => ({ lineup: lu, stackId: ruleId, team: rule.team }))
+                ])
+                if (data.updatedExposure) setGlobalExposureActual(data.updatedExposure)
+            } else {
+                setMultiStackRules(prev => prev.map(r => r.id === ruleId
+                    ? { ...r, status: 'error', errorMessage: data.error || 'Failed' } : r))
+            }
+        } catch (err) {
+            setMultiStackRules(prev => prev.map(r => r.id === ruleId
+                ? { ...r, status: 'error', errorMessage: err.message } : r))
+        }
+    }
+
+    const generateAllStacks = async () => {
+        const pending = multiStackRules.filter(s => s.status !== 'generated')
+        if (pending.length === 0) return
+        for (const stack of pending) {
+            await generateStack(stack.id)
+        }
+    }
+
+    const fetchAiStackSuggestions = async () => {
+        if (eligiblePool.length === 0) { setError('Load a slate first'); return }
+        setAiSuggestLoading(true)
+        try {
+            const res = await fetch('/api/ai-stack-analysis', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    players: eligiblePool.map(p => ({
+                        operatorPlayerName: p.OperatorPlayerName,
+                        operatorPosition: p.OperatorPosition,
+                        operatorSalary: p.OperatorSalary,
+                        team: p.Team,
+                        projectedPoints: parseFloat(getProjection(p)) || 0,
+                        ownershipProjection: parseFloat(getEffectiveOwnership(p)) || 0,
+                    })),
+                    slate: selectedSlate,
+                    sport, platform,
+                    numTotalLineups: multiStackRules.reduce((s, r) => s + r.lineupCount, 0) || 50,
+                    slateNotes: slateNotes.trim(),
+                })
+            })
+            const data = await res.json()
+            if (data.success) setAiSuggestions(data.analysis)
+            else setError(data.error || 'AI suggestion failed')
+        } catch (err) {
+            setError('AI suggestion failed')
+        }
+        setAiSuggestLoading(false)
+    }
+
+    const addStackFromSuggestion = (suggestion) => {
+        const lockedPlayers = (suggestion.players || []).map(name => {
+            const p = eligiblePool.find(ep =>
+                ep.OperatorPlayerName?.toLowerCase().includes(name.toLowerCase()) ||
+                name.toLowerCase().includes(ep.OperatorPlayerName?.toLowerCase())
+            )
+            return p ? {
+                slatePlayerId: p.SlatePlayerID,
+                operatorPlayerName: p.OperatorPlayerName,
+                operatorPosition: p.OperatorPosition,
+                operatorSalary: p.OperatorSalary,
+            } : null
+        }).filter(Boolean)
+        const newRule = {
+            id: crypto.randomUUID(),
+            team: suggestion.team,
+            lockedPlayers,
+            lineupCount: suggestion.lineupCount || 10,
+            minUniquePlayers: 2,
+            reasoning: suggestion.reasoning || '',
+            source: 'ai',
+            status: 'pending',
+            errorMessage: '',
+            generatedLineups: [],
+        }
+        setMultiStackRules(prev => [...prev, newRule])
+    }
+
+    const exportStackBuilderCSV = () => {
+        const toExport = activeStackFilter === 'all'
+            ? allGeneratedLineups
+            : allGeneratedLineups.filter(l => l.stackId === activeStackFilter)
+        const validLineups = toExport.map(l => l.lineup).filter(l => l && l.some(p => p))
+        if (validLineups.length === 0) return
+        const headers = slots.join(',')
+        const rows = validLineups.map(lu => slots.map((_, i) => {
+            const p = lu[i]
+            return p ? `${p.OperatorPlayerName} (${p.OperatorPlayerID || p.SlatePlayerID})` : ''
+        }).join(','))
+        downloadCSV([headers, ...rows].join('\n'), `DFSSZN_Stacks_${validLineups.length}lineups.csv`)
+    }
+    // ─── End Multi-Stack Builder helpers ─────────────────────────────────────
+
     return (
         <div className="min-h-screen" style={{ background: '#0A1628' }}>
 
             {/* Top Nav */}
-            <nav className="fixed top-0 left-0 right-0 z-50 border-b border-[#223366] px-6 h-14 flex items-center gap-6"
+            <nav className="fixed top-0 left-0 right-0 z-50 border-b border-[#223366]"
                 style={{ background: 'rgba(10,22,40,0.97)' }}>
-                <div className="text-xl font-black text-white">
-                    DFS<span className="text-[#FFB800]">SZN</span>
-                </div>
+                <div className="flex items-center gap-2 px-4 h-14 flex-wrap">
 
-                <div className="flex gap-1">
-                    {['mlb', 'nba', 'nfl'].map(s => (
-                        <button key={s} onClick={() => setSport(s)}
-                            className="px-4 py-1.5 rounded-md text-xs font-bold uppercase tracking-wider transition-all"
-                            style={{
-                                background: sport === s ? '#FFB800' : 'transparent',
-                                color: sport === s ? '#0A1628' : '#8A9BBE',
-                                border: sport === s ? 'none' : '1px solid transparent'
-                            }}>
-                            {s}
-                        </button>
-                    ))}
-                </div>
-
-                <div className="flex rounded-lg overflow-hidden border border-[#223366]"
-                    style={{ background: '#132244' }}>
-                    {['draftkings', 'fanduel'].map(p => (
-                        <button key={p} onClick={() => setPlatform(p)}
-                            className="px-4 py-1.5 text-xs font-bold transition-all"
-                            style={{
-                                background: platform === p ? '#1A2E55' : 'transparent',
-                                color: platform === p ? '#FFB800' : '#8A9BBE',
-                            }}>
-                            {p === 'draftkings' ? 'DraftKings' : 'FanDuel'}
-                        </button>
-                    ))}
-                </div>
-
-                <div className="ml-auto flex items-center gap-4">
-                    <div className="flex items-center gap-2 text-xs text-[#8A9BBE] border border-[#223366] rounded-lg px-3 py-1.5"
-                        style={{ background: '#132244' }}>
-                        <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
-                        Live Data
+                    {/* Logo */}
+                    <div className="text-lg font-black text-white mr-2">
+                        DFS<span className="text-[#FFB800]">SZN</span>
                     </div>
-                    <button
-                        onClick={() => setShowGameFilters(true)}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all relative"
-                        style={{
-                            background: (stackTeam || stackRules.lockedPlayers.length > 0 || stackRules.excludedPlayers.length > 0 || fillPool.length > 0) ? 'rgba(255,184,0,0.1)' : '#132244',
-                            borderColor: (stackTeam || stackRules.lockedPlayers.length > 0 || stackRules.excludedPlayers.length > 0 || fillPool.length > 0) ? '#FFB800' : '#223366',
-                            color: (stackTeam || stackRules.lockedPlayers.length > 0 || stackRules.excludedPlayers.length > 0 || fillPool.length > 0) ? '#FFB800' : '#8A9BBE'
-                        }}>
-                        ⚙️ Game Filters
-                        {(stackTeam || stackRules.lockedPlayers.length > 0 || stackRules.excludedPlayers.length > 0 || fillPool.length > 0) && (
-                            <span className="ml-1 px-1.5 py-0.5 rounded-full text-xs"
-                                style={{ background: '#FFB800', color: '#0A1628' }}>
-                                {(stackTeam ? 1 : 0) + stackRules.lockedPlayers.length + stackRules.excludedPlayers.length + fillPool.length}
-                            </span>
-                        )}
-                    </button>
-                    <button
-                        onClick={() => setShowImport(!showImport)}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
-                        style={{
-                            background: Object.keys(importedProjections).length > 0 ? 'rgba(34,197,94,0.1)' : '#132244',
-                            borderColor: Object.keys(importedProjections).length > 0 ? '#22C55E' : '#223366',
-                            color: Object.keys(importedProjections).length > 0 ? '#22C55E' : '#8A9BBE'
-                        }}>
-                        📥 Import
-                        {Object.keys(importedProjections).length > 0 && (
-                            <span className="ml-1 px-1.5 py-0.5 rounded-full text-xs"
-                                style={{ background: '#22C55E', color: '#0A1628' }}>
-                                {Object.keys(importedProjections).length}
-                            </span>
-                        )}
-                    </button>
-                    <button
-                        onClick={() => setShowSlateNotes(!showSlateNotes)}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all flex items-center gap-1.5"
-                        style={{
-                            background: slateNotes ? 'rgba(45,212,191,0.1)' : '#132244',
-                            borderColor: slateNotes ? '#2DD4BF' : '#223366',
-                            color: slateNotes ? '#2DD4BF' : '#8A9BBE'
-                        }}>
-                        📝 Slate Notes
-                        {slateNotes && (
-                            <span className="w-1.5 h-1.5 rounded-full bg-[#2DD4BF]" />
-                        )}
-                    </button>
-                    <button
-                        onClick={fetchAiAnalysis}
-                        disabled={aiLoading}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all flex items-center gap-1.5"
-                        style={{
-                            background: aiAnalysis
-                                ? 'rgba(99,102,241,0.1)' : '#132244',
-                            borderColor: aiAnalysis ? '#818CF8' : '#223366',
-                            color: aiAnalysis ? '#818CF8' : '#8A9BBE'
-                        }}>
-                        {aiLoading ? (
-                            <>⚡ Analyzing...</>
-                        ) : (
-                            <>🤖 AI Analysis</>
-                        )}
-                    </button>
-                    <button
-                        onClick={() => setShowAiCountModal(true)}
-                        disabled={aiBuilding}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all flex items-center gap-1.5"
-                        style={{
-                            background: 'rgba(34,197,94,0.1)',
-                            borderColor: '#22C55E',
-                            color: '#22C55E'
-                        }}>
-                        {aiBuilding ? (
-                            <>⚡ Building...</>
-                        ) : (
-                            <>🤖 AI Build Lineups</>
-                        )}
-                    </button>
-                    <button
-                        onClick={() => {
-                            sessionStorage.removeItem('dfsszn_optimizer_state')
-                            window.location.reload()
-                        }}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold border border-[#223366] text-[#8A9BBE] hover:border-red-400 hover:text-red-400 transition-all"
-                        style={{ background: '#132244' }}
-                        title="Reset all optimizer state">
-                        ↺ Reset
-                    </button>
+
+                    {/* Sport tabs */}
+                    <div className="flex rounded-lg overflow-hidden border border-[#223366]">
+                        {['MLB', 'NBA', 'NFL'].map(s => (
+                            <button key={s} onClick={() => handleSportChange(s.toLowerCase())}
+                                className="px-3 py-1.5 text-xs font-black transition-all"
+                                style={{
+                                    background: sport.toUpperCase() === s ? '#FFB800' : 'transparent',
+                                    color: sport.toUpperCase() === s ? '#0A1628' : '#8A9BBE'
+                                }}>
+                                {s}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Platform toggle */}
+                    <div className="flex rounded-lg overflow-hidden border border-[#223366]">
+                        {['draftkings', 'fanduel'].map(p => (
+                            <button key={p} onClick={() => setPlatform(p)}
+                                className="px-3 py-1.5 text-xs font-bold transition-all"
+                                style={{
+                                    background: platform === p ? '#1A2E55' : 'transparent',
+                                    color: platform === p ? '#FFB800' : '#8A9BBE'
+                                }}>
+                                {p === 'draftkings' ? 'DraftKings' : 'FanDuel'}
+                            </button>
+                        ))}
+                    </div>
+
+                    <div className="w-px h-6 bg-[#223366]" />
+
+                    {/* Slate source toggle */}
+                    <div className="flex rounded-lg overflow-hidden border border-[#223366]">
+                        <button onClick={() => { setSlateSource('live'); fetchSlates() }}
+                            className="px-3 py-1.5 text-xs font-bold transition-all flex items-center gap-1.5"
+                            style={{
+                                background: slateSource === 'live' ? '#1A2E55' : 'transparent',
+                                color: slateSource === 'live' ? '#22C55E' : '#8A9BBE'
+                            }}>
+                            <span className="w-1.5 h-1.5 rounded-full"
+                                style={{ background: slateSource === 'live' ? '#22C55E' : '#8A9BBE' }} />
+                            Live
+                        </button>
+                        <button onClick={() => setShowSlateUpload(true)}
+                            className="px-3 py-1.5 text-xs font-bold transition-all"
+                            style={{
+                                background: slateSource === 'manual' ? '#1A2E55' : 'transparent',
+                                color: slateSource === 'manual' ? '#FFB800' : '#8A9BBE'
+                            }}>
+                            📄 Manual{slateSource === 'manual' && <span className="ml-1 text-[#22C55E]">✓</span>}
+                        </button>
+                    </div>
+
+                    {optimizerStatus === 'sleeping' && (
+                        <div className="text-xs px-2 py-1 rounded-lg flex items-center gap-1.5"
+                            style={{
+                                background: 'rgba(255,184,0,0.1)',
+                                color: '#FFB800',
+                                border: '1px solid rgba(255,184,0,0.2)'
+                            }}>
+                            <span className="animate-pulse">⚡</span>
+                            Optimizer waking up…
+                        </div>
+                    )}
+
+                    <div className="w-px h-6 bg-[#223366]" />
+
+                    {/* Tool buttons */}
+                    {[
+                        {
+                            label: 'Import',
+                            icon: '📥',
+                            active: Object.keys(importedProjections).length > 0,
+                            onClick: () => setShowImport(!showImport),
+                            badge: Object.keys(importedProjections).length || null,
+                        },
+                        {
+                            label: 'Filters',
+                            icon: '⚙️',
+                            active: !!(multiStackRules.length || pitcherPool.length || commonPool.length || legacyRules.excludedPlayers.length),
+                            onClick: () => setShowGameFilters(true),
+                            badge: (multiStackRules.length + pitcherPool.length + commonPool.length + legacyRules.excludedPlayers.length) || null,
+                        },
+                        {
+                            label: 'Notes',
+                            icon: '📝',
+                            active: slateNotes.length > 0,
+                            onClick: () => setShowSlateNotes(!showSlateNotes),
+                            badge: null,
+                        },
+                        {
+                            label: 'Stack Builder',
+                            icon: '⚡',
+                            active: showStackBuilder || multiStackRules.length > 0,
+                            onClick: () => setShowStackBuilder(v => !v),
+                            badge: multiStackRules.length || null,
+                            gold: true,
+                        },
+                        {
+                            label: aiLoading ? 'Analyzing…' : 'AI Analysis',
+                            icon: aiLoading ? '⚡' : '🤖',
+                            active: !!aiAnalysis,
+                            onClick: fetchAiAnalysis,
+                            disabled: aiLoading,
+                            badge: null,
+                        },
+                    ].map(btn => (
+                        <button key={btn.label}
+                            onClick={btn.onClick}
+                            disabled={btn.disabled}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                            style={{
+                                background: btn.active ? 'rgba(255,184,0,0.08)' : '#132244',
+                                borderColor: btn.active ? 'rgba(255,184,0,0.3)' : '#223366',
+                                color: btn.active ? '#FFB800' : '#8A9BBE',
+                                opacity: btn.disabled ? 0.6 : 1,
+                            }}>
+                            <span>{btn.icon}</span>
+                            <span>{btn.label}</span>
+                            {btn.badge > 0 && (
+                                <span className="px-1.5 py-0.5 rounded-full text-xs font-black"
+                                    style={{ background: '#FFB800', color: '#0A1628' }}>
+                                    {btn.badge}
+                                </span>
+                            )}
+                        </button>
+                    ))}
+
+                    {/* AI Build + Reset — right side */}
+                    <div className="ml-auto flex items-center gap-2">
+                        <button onClick={() => setShowAiCountModal(true)} disabled={aiBuilding}
+                            className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-xs font-black border transition-all"
+                            style={{
+                                background: 'rgba(34,197,94,0.1)',
+                                borderColor: '#22C55E',
+                                color: '#22C55E',
+                                opacity: aiBuilding ? 0.7 : 1,
+                            }}>
+                            {aiBuilding ? '⚡ Building…' : '🤖 AI Build'}
+                        </button>
+                        <button
+                            onClick={() => { sessionStorage.removeItem('dfsszn_optimizer_state'); window.location.reload() }}
+                            className="px-3 py-1.5 rounded-lg text-xs font-bold border border-[#223366] text-[#8A9BBE] hover:border-red-400 hover:text-red-400 transition-all"
+                            style={{ background: '#132244' }}
+                            title="Reset all optimizer state">
+                            ↺ Reset
+                        </button>
+                    </div>
                 </div>
             </nav>
 
@@ -2214,6 +2777,7 @@ export default function Optimizer() {
                         <div className="text-xs font-semibold text-[#8A9BBE] uppercase tracking-widest mb-2">Tools</div>
                         {[
                             { label: 'Optimizer', icon: '⚡', active: true, href: '/dashboard/optimizer' },
+                            { label: 'AI Chat', icon: '💬', active: false, href: '/dashboard/chat' },
                             { label: 'My Lineups', icon: '📋', active: false, href: '/dashboard/lineups' },
                         ].map(item => (
                             <a key={item.label}
@@ -2464,7 +3028,7 @@ export default function Optimizer() {
                                 </button>
                                 <button
                                     onClick={() => {
-                                        setStackRules(prev => ({
+                                        setLegacyRules(prev => ({
                                             ...prev,
                                             excludedPlayers: prev.excludedPlayers.filter(ep =>
                                                 players.find(p => {
@@ -2493,128 +3057,116 @@ export default function Optimizer() {
                         </div>
                     )}
 
-                    {/* Game Tiles - Collapsible */}
-                    {selectedSlate?.DfsSlateGames?.length > 0 && (
-                        <div className="mb-4 rounded-xl border border-[#223366] overflow-hidden"
-                            style={{ background: '#132244' }}>
+                    {/* Game Filter Bar */}
+                    {players.length > 0 && (
+                        <div className="mb-2">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                                <button
+                                    onClick={() => setGameFilter(null)}
+                                    className="px-2.5 py-1 rounded-lg text-xs font-bold border transition-all shrink-0"
+                                    style={{
+                                        background: !gameFilter ? 'rgba(255,184,0,0.1)' : '#132244',
+                                        borderColor: !gameFilter ? '#FFB800' : '#223366',
+                                        color: !gameFilter ? '#FFB800' : '#8A9BBE'
+                                    }}>
+                                    ALL
+                                </button>
 
-                            {/* Header - always visible */}
-                            <button
-                                onClick={() => setGameTilesOpen(!gameTilesOpen)}
-                                className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-[#1A2E55] transition-colors">
-                                <div className="flex items-center gap-3 min-w-0">
-                                    <span className="text-xs font-bold text-white shrink-0">🎮 Games</span>
-                                    {selectedSlate && (
-                                        <span className="text-xs text-[#8A9BBE] shrink-0">
-                                            {selectedSlate.NumberOfGames} games · {selectedSlate.OperatorName}
+                                <div className="w-px h-4 bg-[#223366] shrink-0" />
+
+                                {(() => {
+                                    const games = selectedSlate?.DfsSlateGames || []
+
+                                    if (games.length > 0) {
+                                        return games.map(sg => {
+                                            const g = sg.Game || {}
+                                            const away = g.AwayTeam || ''
+                                            const home = g.HomeTeam || ''
+                                            const ou = g.OverUnder
+                                            const gameId = sg.SlateGameID
+                                            const isGameActive = gameFilter?.type === 'game' && gameFilter?.gameId === gameId
+                                            const isAwayActive = gameFilter?.type === 'team' && gameFilter?.team === away
+                                            const isHomeActive = gameFilter?.type === 'team' && gameFilter?.team === home
+
+                                            return (
+                                                <div key={gameId}
+                                                    className="flex items-center rounded-lg overflow-hidden border shrink-0"
+                                                    style={{
+                                                        borderColor: isGameActive ? '#FFB800' : (isAwayActive || isHomeActive) ? 'rgba(255,184,0,0.4)' : '#223366',
+                                                        background: '#132244'
+                                                    }}>
+                                                    <button
+                                                        onClick={() => setGameFilter(isAwayActive ? null : { type: 'team', team: away })}
+                                                        className="px-2.5 py-1 text-xs font-black transition-all"
+                                                        style={{
+                                                            background: isAwayActive ? '#FFB800' : 'transparent',
+                                                            color: isAwayActive ? '#0A1628' : '#ffffff'
+                                                        }}>
+                                                        {away}
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setGameFilter(isGameActive ? null : { type: 'game', gameId })}
+                                                        className="px-1.5 py-1 transition-all border-x border-[#223366]"
+                                                        style={{
+                                                            background: isGameActive ? 'rgba(255,184,0,0.1)' : 'transparent',
+                                                            color: isGameActive ? '#FFB800' : '#556080',
+                                                            fontSize: '10px',
+                                                            lineHeight: 1,
+                                                            minWidth: '28px',
+                                                            textAlign: 'center'
+                                                        }}>
+                                                        <div>@</div>
+                                                        {ou && <div className="font-bold" style={{ color: isGameActive ? '#FFB800' : '#8A9BBE' }}>{ou}</div>}
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setGameFilter(isHomeActive ? null : { type: 'team', team: home })}
+                                                        className="px-2.5 py-1 text-xs font-black transition-all"
+                                                        style={{
+                                                            background: isHomeActive ? '#FFB800' : 'transparent',
+                                                            color: isHomeActive ? '#0A1628' : '#ffffff'
+                                                        }}>
+                                                        {home}
+                                                    </button>
+                                                </div>
+                                            )
+                                        })
+                                    }
+
+                                    // Fallback: team pills from player data
+                                    const teams = [...new Set(players.map(p => p.Team).filter(Boolean))].sort()
+                                    return teams.map(team => {
+                                        const isActive = gameFilter?.type === 'team' && gameFilter?.team === team
+                                        return (
+                                            <button key={team}
+                                                onClick={() => setGameFilter(isActive ? null : { type: 'team', team })}
+                                                className="px-2.5 py-1 rounded-lg text-xs font-black border transition-all shrink-0"
+                                                style={{
+                                                    background: isActive ? '#FFB800' : '#132244',
+                                                    borderColor: isActive ? '#FFB800' : '#223366',
+                                                    color: isActive ? '#0A1628' : '#B8C5D6'
+                                                }}>
+                                                {team}
+                                            </button>
+                                        )
+                                    })
+                                })()}
+
+                                {gameFilter && (
+                                    <div className="ml-auto flex items-center gap-1.5 text-xs shrink-0">
+                                        <span style={{ color: '#FFB800' }}>
+                                            {gameFilter.type === 'team' ? gameFilter.team : 'Game'} only
                                         </span>
-                                    )}
-                                    {!gameTilesOpen && (
-                                        <div className="flex gap-1.5 overflow-hidden">
-                                            {selectedSlate.DfsSlateGames.slice(0, 4).map((sg, i) => (
-                                                <span key={i}
-                                                    className="text-xs font-bold px-2 py-0.5 rounded shrink-0"
-                                                    style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800' }}>
-                                                    {sg.Game?.AwayTeam}@{sg.Game?.HomeTeam}
-                                                </span>
-                                            ))}
-                                            {selectedSlate.DfsSlateGames.length > 4 && (
-                                                <span className="text-xs text-[#8A9BBE] shrink-0">
-                                                    +{selectedSlate.DfsSlateGames.length - 4} more
-                                                </span>
-                                            )}
-                                        </div>
-                                    )}
-                                </div>
-                                <span className="text-xs text-[#8A9BBE] shrink-0 ml-2">
-                                    {gameTilesOpen ? '▲' : '▼'}
-                                </span>
-                            </button>
-
-                            {/* Expanded game tiles */}
-                            {gameTilesOpen && (
-                                <div className="border-t border-[#223366] p-3">
-                                    <div className="flex gap-2 overflow-x-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
                                         <button
                                             onClick={() => setGameFilter(null)}
-                                            className="shrink-0 px-3 py-2 rounded-xl text-xs font-semibold border transition-all"
-                                            style={{
-                                                background: !gameFilter ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                borderColor: !gameFilter ? '#FFB800' : '#223366',
-                                                color: !gameFilter ? '#FFB800' : '#8A9BBE',
-                                            }}>
-                                            All Games
+                                            className="text-[#8A9BBE] hover:text-[#EF4444] transition-colors font-bold">
+                                            ✕
                                         </button>
-                                        {selectedSlate.DfsSlateGames.map(sg => {
-                                            const g = sg.Game
-                                            if (!g) return null
-                                            const isSelected = gameFilter === sg.SlateGameID
-                                            const dotColor = ouDotColor(g.OverUnder)
-                                            const score = getGameScore(sg)
-                                            return (
-                                                <button
-                                                    key={sg.SlateGameID}
-                                                    onClick={() => setGameFilter(isSelected ? null : sg.SlateGameID)}
-                                                    className="shrink-0 rounded-xl border transition-all text-left"
-                                                    style={{
-                                                        background: isSelected ? 'rgba(255,184,0,0.08)' : '#0A1628',
-                                                        borderColor: isSelected ? '#FFB800' : '#223366',
-                                                        padding: '10px 12px',
-                                                        minWidth: '148px',
-                                                    }}>
-                                                    <div className="flex items-center justify-between gap-2 mb-0.5">
-                                                        <span className="text-sm font-bold text-white leading-tight">
-                                                            {g.AwayTeam} @ {g.HomeTeam}
-                                                        </span>
-                                                        <span className="w-2.5 h-2.5 rounded-full shrink-0"
-                                                            style={{ background: dotColor }} />
-                                                    </div>
-                                                    <div className="text-xs mb-1.5" style={{ color: '#FFB800' }}>
-                                                        {formatGameTime(g.DateTime)}
-                                                    </div>
-                                                    <div className="text-xs text-[#8A9BBE] mb-0.5">
-                                                        O/U {g.OverUnder ?? '—'}
-                                                        {g.PointSpread != null && (
-                                                            <span className="ml-2 text-[#556080]">
-                                                                ({g.PointSpread > 0 ? '+' : ''}{g.PointSpread})
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <div className="flex items-center gap-2 text-xs text-[#8A9BBE]">
-                                                        {g.ForecastWindSpeed != null && (
-                                                            <span>💨 {g.ForecastWindSpeed} mph</span>
-                                                        )}
-                                                        {g.ForecastTempHigh != null && (
-                                                            <span>🌡️ {g.ForecastTempHigh}°F</span>
-                                                        )}
-                                                    </div>
-                                                    <div className="flex items-center justify-between mt-2 pt-2 border-t"
-                                                        style={{ borderColor: 'rgba(34,51,102,0.5)' }}>
-                                                        <div className="text-xs" style={{ color: '#8A9BBE' }}>Env Score</div>
-                                                        <div className="flex items-center gap-1.5">
-                                                            <div className="text-sm font-black" style={{ color: getScoreColor(score) }}>
-                                                                {score}/10
-                                                            </div>
-                                                            <div className="text-xs font-semibold px-1.5 py-0.5 rounded"
-                                                                style={{
-                                                                    background: `${getScoreColor(score)}20`,
-                                                                    color: getScoreColor(score)
-                                                                }}>
-                                                                {getScoreLabel(score)}
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                    <div className="text-xs mt-1" style={{ color: '#8A9BBE' }}>
-                                                        {getTopFactor(sg)}
-                                                    </div>
-                                                </button>
-                                            )
-                                        })}
                                     </div>
-                                </div>
-                            )}
+                                )}
+                            </div>
                         </div>
                     )}
+
 
                     {showSlateNotes && (
                         <div className="mb-4 rounded-xl border border-[#223366] overflow-hidden"
@@ -2677,6 +3229,497 @@ export default function Optimizer() {
                             </div>
                         </div>
                     )}
+
+                    {/* ──── MULTI-STACK BUILDER ──────────────────────────────── */}
+                    {showStackBuilder && (
+                        <div className="mb-4">
+
+                            {sport === 'nfl' && (
+                                <div className="mb-3 p-3 rounded-xl border border-[#223366]" style={{ background: '#132244' }}>
+                                    <div className="text-xs font-bold text-[#FFB800] mb-1">🏈 NFL Stack Logic</div>
+                                    <div className="text-xs text-[#8A9BBE]">
+                                        Select a QB to auto-stack with pass catchers from the same team. Click 🔒 on a QB
+                                        then add WR/TE teammates to the same stack.
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Stack Builder Header */}
+                            <div className="flex items-center justify-between mb-3">
+                                <div className="flex items-center gap-3">
+                                    <h2 className="text-sm font-black text-white">⚡ Stack Builder</h2>
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-[#8A9BBE]">Salary:</span>
+                                        <input value={salaryMin} onChange={e => setSalaryMin(e.target.value)}
+                                            className="w-20 text-xs text-center text-white border border-[#223366] rounded px-1 py-0.5 outline-none"
+                                            style={{background:'#132244'}} placeholder="49500" />
+                                        <span className="text-xs text-[#8A9BBE]">–</span>
+                                        <input value={salaryMax} onChange={e => setSalaryMax(e.target.value)}
+                                            className="w-20 text-xs text-center text-white border border-[#223366] rounded px-1 py-0.5 outline-none"
+                                            style={{background:'#132244'}} placeholder="50000" />
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <button onClick={() => {
+                                        const newRule = {
+                                            id: crypto.randomUUID(), team: '', lockedPlayers: [], lineupCount: 10,
+                                            minUniquePlayers: 2, reasoning: '', source: 'manual',
+                                            status: 'pending', errorMessage: '', generatedLineups: []
+                                        }
+                                        setMultiStackRules(prev => [...prev, newRule])
+                                    }} className="px-3 py-1.5 rounded-lg text-xs font-bold border border-[#223366] text-[#B8C5D6]"
+                                        style={{background:'#132244'}}>+ New Stack</button>
+                                    <button onClick={generateAllStacks}
+                                        disabled={!!generatingProgress || multiStackRules.length === 0}
+                                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                                        style={{background:'rgba(34,197,94,0.15)', borderColor:'#22C55E', color:'#22C55E',
+                                            opacity: (!!generatingProgress || multiStackRules.length === 0) ? 0.5 : 1}}>
+                                        {generatingProgress
+                                            ? `⚡ ${generatingProgress.current}/${generatingProgress.total}: ${generatingProgress.teamName}`
+                                            : '⚡ Generate All'}
+                                    </button>
+                                    <button onClick={fetchAiStackSuggestions}
+                                        disabled={aiSuggestLoading}
+                                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                                        style={{background:'rgba(45,212,191,0.1)', borderColor:'#2DD4BF', color:'#2DD4BF',
+                                            opacity: aiSuggestLoading ? 0.5 : 1}}>
+                                        {aiSuggestLoading ? '⚡ Analyzing...' : '🤖 AI Suggest'}
+                                    </button>
+                                    {allGeneratedLineups.length > 0 && (
+                                        <button onClick={exportStackBuilderCSV}
+                                            className="px-3 py-1.5 rounded-lg text-xs font-bold border border-[#223366] text-[#B8C5D6]"
+                                            style={{background:'#132244'}}>
+                                            📥 Export CSV
+                                        </button>
+                                    )}
+                                    {allGeneratedLineups.length > 0 && (
+                                        <button onClick={() => setAllGeneratedLineups([])}
+                                            className="px-3 py-1.5 rounded-lg text-xs font-bold text-[#EF4444] border border-[#EF4444]"
+                                            style={{background:'rgba(239,68,68,0.1)'}}>
+                                            Clear Lineups
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Two-column layout */}
+                            <div style={{display:'flex', gap:'12px', alignItems:'flex-start'}}>
+
+                                {/* LEFT: Player Pool */}
+                                <div style={{width:'380px', flexShrink:0}}>
+                                    <div className="rounded-xl border border-[#223366] overflow-hidden mb-3" style={{background:'#0F1E38'}}>
+                                        <div className="px-3 py-2 border-b border-[#223366] flex items-center gap-2" style={{background:'#1A2E55'}}>
+                                            <span className="text-xs font-black text-white">Player Pool</span>
+                                            {gameFilter ? (
+                                                <span className="text-xs text-[#FFB800] font-bold">
+                                                    {stackBuilderFilteredPlayers.length} players
+                                                    {gameFilter.type === 'team' ? ` from ${gameFilter.team}` : ' in selected game'}
+                                                </span>
+                                            ) : (
+                                                <span className="text-xs text-[#8A9BBE]">{stackBuilderFilteredPlayers.length} players</span>
+                                            )}
+                                            <div className="ml-auto flex items-center gap-1">
+                                                {(POSITIONS[sport] || []).map(pos => (
+                                                    <button key={pos} onClick={() => setStackBuilderPosFilter(pos)}
+                                                        className="px-1.5 py-0.5 rounded text-xs font-bold transition-all"
+                                                        style={{
+                                                            background: stackBuilderPosFilter === pos ? '#FFB800' : 'transparent',
+                                                            color: stackBuilderPosFilter === pos ? '#0A1628' : '#8A9BBE',
+                                                        }}>{pos}</button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                        <div className="px-3 py-2 border-b border-[#223366]">
+                                            <input value={stackBuilderSearch} onChange={e => setStackBuilderSearch(e.target.value)}
+                                                placeholder="Search players…"
+                                                className="w-full text-xs bg-transparent text-white outline-none placeholder-[#8A9BBE]" />
+                                        </div>
+                                        {(stackBuilderPosFilter !== 'ALL' || stackBuilderSearch) && (
+                                            <div className="px-3 py-1.5 border-b border-[#223366] text-xs text-[#8A9BBE]">
+                                                {stackBuilderFilteredPlayers.length} players
+                                                {stackBuilderPosFilter !== 'ALL' && (
+                                                    <span className="ml-1 text-[#FFB800]">· {stackBuilderPosFilter} filter active</span>
+                                                )}
+                                                {stackBuilderSearch && (
+                                                    <span className="ml-1 text-[#FFB800]">· &quot;{stackBuilderSearch}&quot;</span>
+                                                )}
+                                            </div>
+                                        )}
+                                        <div style={{maxHeight:'320px', overflowY:'auto'}}>
+                                            {stackBuilderFilteredPlayers.slice(0, 100).map(p => {
+                                                const isPitcher = p.OperatorPosition === 'SP' || p.OperatorPosition === 'RP'
+                                                const inPPool = isInPitcherPool(p)
+                                                const inCPool = isInCommonPool(p)
+                                                const pStacks = getPlayerStacks(p)
+                                                return (
+                                                    <div key={p.SlatePlayerID} className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[#1A2E55] hover:bg-[#1A2E55] transition-colors">
+                                                        <span className="text-xs w-6 text-center font-bold"
+                                                            style={{color: isPitcher ? '#FFB800' : '#818CF8'}}>
+                                                            {p.OperatorPosition}
+                                                        </span>
+                                                        <span className="text-xs text-white flex-1 truncate">{p.OperatorPlayerName}</span>
+                                                        <span className="text-xs text-[#8A9BBE] w-8">{p.Team}</span>
+                                                        <span className="text-xs text-[#B8C5D6] w-12 text-right">${(p.OperatorSalary/1000).toFixed(1)}k</span>
+                                                        <span className="text-xs text-[#22C55E] w-8 text-right">{getProjection(p).toFixed(1)}</span>
+                                                        {pStacks.length > 0 && (
+                                                            <div className="flex gap-0.5">
+                                                                {pStacks.slice(0,2).map(r => (
+                                                                    <span key={r.id} className="w-1.5 h-1.5 rounded-full" style={{background:'#FFB800'}} title={r.team} />
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        <button title="Add to stack" onClick={() => { setStackModalPlayer(p); setShowStackModal(true) }}
+                                                            className="text-xs px-1.5 py-0.5 rounded transition-colors"
+                                                            style={{background:'rgba(255,184,0,0.15)', color:'#FFB800'}}>🔒</button>
+                                                        <button title={isPitcher ? 'Add to pitcher pool' : 'Add to common pool'}
+                                                            onClick={() => {
+                                                                const payload = { slatePlayerId: p.SlatePlayerID, operatorPlayerName: p.OperatorPlayerName, operatorPosition: p.OperatorPosition, operatorSalary: p.OperatorSalary, team: p.Team, maxExposurePct: isPitcher ? 35 : 50, source: 'manual' }
+                                                                if (isPitcher) {
+                                                                    if (!inPPool) setPitcherPool(prev => [...prev, payload])
+                                                                    else setPitcherPool(prev => prev.filter(pp => pp.slatePlayerId !== p.SlatePlayerID))
+                                                                } else {
+                                                                    if (!inCPool) setCommonPool(prev => [...prev, payload])
+                                                                    else setCommonPool(prev => prev.filter(cp => cp.slatePlayerId !== p.SlatePlayerID))
+                                                                }
+                                                            }}
+                                                            className="text-xs px-1.5 py-0.5 rounded transition-colors"
+                                                            style={{
+                                                                background: (isPitcher ? inPPool : inCPool) ? 'rgba(34,197,94,0.2)' : 'rgba(129,140,248,0.15)',
+                                                                color: (isPitcher ? inPPool : inCPool) ? '#22C55E' : '#818CF8'
+                                                            }}>
+                                                            {isPitcher ? (inPPool ? '✓⚾' : '⚾') : (inCPool ? '✓🎯' : '🎯')}
+                                                        </button>
+                                                    </div>
+                                                )
+                                            })}
+                                        </div>
+                                    </div>
+
+                                    {/* Pitcher Pool */}
+                                    {pitcherPool.length > 0 && (
+                                        <div className="rounded-xl border border-[#223366] overflow-hidden mb-3" style={{background:'#0F1E38'}}>
+                                            <div className="px-3 py-2 border-b border-[#223366] flex items-center justify-between" style={{background:'#1A2E55'}}>
+                                                <span className="text-xs font-black text-[#FFB800]">⚾ Pitcher Pool ({pitcherPool.length})</span>
+                                            </div>
+                                            {pitcherPool.map(pp => {
+                                                const hasConflict = multiStackRules.some(r => r.team === pp.team)
+                                                return (
+                                                    <div key={pp.slatePlayerId} className="px-3 py-2 flex items-center gap-2 border-b border-[#1A2E55] text-xs">
+                                                        <span className="text-white flex-1">{pp.operatorPlayerName}</span>
+                                                        {hasConflict && <span className="text-[#FFB800]">⚠ vs stack</span>}
+                                                        <span className="text-[#8A9BBE]">{pp.maxExposurePct}%</span>
+                                                        <input type="range" min={0} max={100} value={pp.maxExposurePct || 35}
+                                                            onChange={e => setPitcherPool(prev => prev.map(p2 => p2.slatePlayerId === pp.slatePlayerId ? {...p2, maxExposurePct: parseInt(e.target.value)} : p2))}
+                                                            className="w-14" />
+                                                        <button onClick={() => setPitcherPool(prev => prev.filter(p2 => p2.slatePlayerId !== pp.slatePlayerId))}
+                                                            className="text-[#EF4444]">✕</button>
+                                                    </div>
+                                                )
+                                            })}
+                                        </div>
+                                    )}
+
+                                    {/* Common Pool */}
+                                    {commonPool.length > 0 && (
+                                        <div className="rounded-xl border border-[#223366] overflow-hidden" style={{background:'#0F1E38'}}>
+                                            <div className="px-3 py-2 border-b border-[#223366] flex items-center justify-between" style={{background:'#1A2E55'}}>
+                                                <span className="text-xs font-black text-[#818CF8]">🎯 Common Pool ({commonPool.length})</span>
+                                                <span className="text-xs text-[#8A9BBE]">fills non-locked slots</span>
+                                            </div>
+                                            {commonPool.map(cp => (
+                                                <div key={cp.slatePlayerId} className="px-3 py-2 flex items-center gap-2 border-b border-[#1A2E55] text-xs">
+                                                    <span className="text-white flex-1">{cp.operatorPlayerName}</span>
+                                                    <span className="text-[#8A9BBE]">{cp.team}</span>
+                                                    <span className="text-[#8A9BBE]">{cp.maxExposurePct}%</span>
+                                                    <input type="range" min={0} max={100} value={cp.maxExposurePct || 50}
+                                                        onChange={e => setCommonPool(prev => prev.map(p2 => p2.slatePlayerId === cp.slatePlayerId ? {...p2, maxExposurePct: parseInt(e.target.value)} : p2))}
+                                                        className="w-14" />
+                                                    <button onClick={() => setCommonPool(prev => prev.filter(p2 => p2.slatePlayerId !== cp.slatePlayerId))}
+                                                        className="text-[#EF4444]">✕</button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* RIGHT: Stack Cards + Lineups */}
+                                <div style={{flex:1, minWidth:0}}>
+
+                                    {/* AI Suggestions Panel */}
+                                    {aiSuggestions && (
+                                        <div className="mb-4 rounded-xl border border-[#2DD4BF] overflow-hidden" style={{background:'#0F1E38'}}>
+                                            <div className="px-4 py-3 border-b border-[#2DD4BF] flex items-center justify-between" style={{background:'rgba(45,212,191,0.05)'}}>
+                                                <div>
+                                                    <span className="text-sm font-black text-white">🤖 AI Stack Suggestions</span>
+                                                    <span className="ml-2 text-xs text-[#8A9BBE]">Review and add to your builder</span>
+                                                </div>
+                                                <button onClick={() => setAiSuggestions(null)} className="text-[#8A9BBE] hover:text-white text-sm">✕</button>
+                                            </div>
+                                            <div className="px-4 py-2 border-b border-[#223366] flex items-center gap-2" style={{background:'rgba(255,184,0,0.05)'}}>
+                                                <span className="text-xs text-[#FFB800]">⚠</span>
+                                                <span className="text-xs text-[#B8C5D6]">{aiSuggestions.ownership_disclaimer || 'Ownership projections are model estimates, not from a live feed'}</span>
+                                            </div>
+                                            {aiSuggestions.slate_summary && (
+                                                <div className="px-4 py-3 border-b border-[#223366]">
+                                                    <p className="text-xs text-[#B8C5D6]">{aiSuggestions.slate_summary}</p>
+                                                </div>
+                                            )}
+                                            <div className="p-4 space-y-3">
+                                                {aiSuggestions.suggested_stacks?.map((s, i) => (
+                                                    <div key={i} className="rounded-lg border border-[#223366] p-3" style={{background:'#132244'}}>
+                                                        <div className="flex items-center justify-between mb-2">
+                                                            <div className="flex items-center gap-2">
+                                                                <span className="px-2 py-0.5 rounded text-xs font-black" style={{background:'rgba(255,184,0,0.15)', color:'#FFB800'}}>{s.team}</span>
+                                                                <span className="text-xs text-[#B8C5D6]">{s.lineupCount} lineups</span>
+                                                                <span className="text-xs px-1.5 py-0.5 rounded" style={{background:'rgba(255,184,0,0.1)', color:'#FFB800'}}>⚠ Est. own%</span>
+                                                            </div>
+                                                            <button onClick={() => addStackFromSuggestion(s)}
+                                                                className="px-2 py-1 rounded text-xs font-bold"
+                                                                style={{background:'rgba(45,212,191,0.15)', color:'#2DD4BF', border:'1px solid rgba(45,212,191,0.3)'}}>
+                                                                + Add Stack
+                                                            </button>
+                                                        </div>
+                                                        <div className="flex flex-wrap gap-1 mb-2">
+                                                            {s.players?.map(name => (
+                                                                <span key={name} className="px-2 py-0.5 rounded-full text-xs" style={{background:'rgba(34,197,94,0.15)', color:'#22C55E'}}>{name}</span>
+                                                            ))}
+                                                        </div>
+                                                        {s.reasoning && <p className="text-xs text-[#8A9BBE] italic">{s.reasoning}</p>}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                            {aiSuggestions.suggested_pitcher_pool?.length > 0 && (
+                                                <div className="px-4 pb-4">
+                                                    <div className="text-xs font-bold text-[#FFB800] mb-2">Suggested Pitcher Pool</div>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {aiSuggestions.suggested_pitcher_pool.map((p, i) => (
+                                                            <button key={i} onClick={() => {
+                                                                const found = eligiblePool.find(ep => ep.OperatorPlayerName?.toLowerCase().includes(p.name.toLowerCase()))
+                                                                if (found && !pitcherPool.some(pp => pp.slatePlayerId === found.SlatePlayerID)) {
+                                                                    setPitcherPool(prev => [...prev, { slatePlayerId: found.SlatePlayerID, operatorPlayerName: found.OperatorPlayerName, operatorPosition: found.OperatorPosition, operatorSalary: found.OperatorSalary, team: found.Team, maxExposurePct: p.maxExposurePct || 35, source: 'ai' }])
+                                                                }
+                                                            }} className="px-2 py-1 rounded text-xs" style={{background:'rgba(255,184,0,0.1)', color:'#FFB800', border:'1px solid rgba(255,184,0,0.2)'}}>
+                                                                + {p.name} ({p.maxExposurePct}%)
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {aiSuggestions.suggested_common_pool?.length > 0 && (
+                                                <div className="px-4 pb-4">
+                                                    <div className="text-xs font-bold text-[#818CF8] mb-2">Suggested Common Pool</div>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {aiSuggestions.suggested_common_pool.map((p, i) => (
+                                                            <button key={i} onClick={() => {
+                                                                const found = eligiblePool.find(ep => ep.OperatorPlayerName?.toLowerCase().includes(p.name.toLowerCase()))
+                                                                if (found && !commonPool.some(cp => cp.slatePlayerId === found.SlatePlayerID)) {
+                                                                    setCommonPool(prev => [...prev, { slatePlayerId: found.SlatePlayerID, operatorPlayerName: found.OperatorPlayerName, operatorPosition: found.OperatorPosition, operatorSalary: found.OperatorSalary, team: found.Team, maxExposurePct: p.maxExposurePct || 50, source: 'ai' }])
+                                                                }
+                                                            }} className="px-2 py-1 rounded text-xs" style={{background:'rgba(129,140,248,0.1)', color:'#818CF8', border:'1px solid rgba(129,140,248,0.2)'}}>
+                                                                + {p.name}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {/* Stack Cards */}
+                                    {multiStackRules.length === 0 && !aiSuggestions && (
+                                        <div className="text-center py-10 text-[#8A9BBE] text-sm rounded-xl border border-dashed border-[#223366]">
+                                            No stacks yet. Add players from the pool with 🔒 or use 🤖 AI Suggest.
+                                        </div>
+                                    )}
+                                    {multiStackRules.map(rule => (
+                                        <div key={rule.id} className="mb-3 rounded-xl border overflow-hidden" style={{background:'#0F1E38', borderColor: rule.status === 'generated' ? '#22C55E' : rule.status === 'error' ? '#EF4444' : rule.status === 'generating' ? '#FFB800' : '#223366'}}>
+                                            <div className="px-4 py-2.5 border-b border-[#223366] flex items-center gap-2" style={{background:'#1A2E55'}}>
+                                                <span className="px-2 py-0.5 rounded text-xs font-black" style={{background:'rgba(255,184,0,0.15)', color:'#FFB800'}}>{rule.team || '—'}</span>
+                                                <input value={rule.team}
+                                                    onChange={e => setMultiStackRules(prev => prev.map(r => r.id === rule.id ? {...r, team: e.target.value.toUpperCase()} : r))}
+                                                    placeholder="Team…"
+                                                    className="text-xs bg-transparent text-white outline-none w-16"
+                                                />
+                                                {rule.source === 'ai' && <span className="text-xs text-[#2DD4BF]">🤖 AI</span>}
+                                                <span className="ml-auto text-xs font-bold" style={{color: rule.status === 'generated' ? '#22C55E' : rule.status === 'error' ? '#EF4444' : rule.status === 'generating' ? '#FFB800' : '#8A9BBE'}}>
+                                                    {rule.status === 'generated' ? `✓ ${rule.generatedLineups.length} lineups` : rule.status === 'error' ? '✗ Error' : rule.status === 'generating' ? '⚡ Generating…' : '○ Pending'}
+                                                </span>
+                                                <button onClick={() => generateStack(rule.id)}
+                                                    disabled={rule.status === 'generating' || eligiblePool.length === 0}
+                                                    className="px-2 py-1 rounded text-xs font-bold"
+                                                    style={{background:'rgba(34,197,94,0.15)', color:'#22C55E', border:'1px solid rgba(34,197,94,0.3)', opacity: (rule.status === 'generating' || eligiblePool.length === 0) ? 0.5 : 1}}>
+                                                    ⚡
+                                                </button>
+                                                <button onClick={() => setMultiStackRules(prev => prev.filter(r => r.id !== rule.id))}
+                                                    className="text-xs text-[#8A9BBE] hover:text-[#EF4444]">✕</button>
+                                            </div>
+                                            <div className="px-4 py-2 flex flex-wrap gap-1">
+                                                {rule.lockedPlayers.map(lp => (
+                                                    <span key={getLockedId(lp)} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs" style={{background:'rgba(34,197,94,0.15)', color:'#22C55E', border:'1px solid rgba(34,197,94,0.2)'}}>
+                                                        {getLockedName(lp)}
+                                                        <button onClick={() => setMultiStackRules(prev => prev.map(r => r.id === rule.id ? {...r, lockedPlayers: r.lockedPlayers.filter(p => getLockedId(p) !== getLockedId(lp))} : r))}
+                                                            className="hover:text-[#EF4444]">×</button>
+                                                    </span>
+                                                ))}
+                                                {rule.lockedPlayers.length === 0 && <span className="text-xs text-[#8A9BBE]">No locked players — use 🔒 in player pool</span>}
+                                            </div>
+                                            <div className="px-4 py-2 flex items-center gap-4 border-t border-[#1A2E55]">
+                                                <div className="flex items-center gap-1 text-xs">
+                                                    <span className="text-[#8A9BBE]">Lineups:</span>
+                                                    <input type="number" min={1} max={150} value={rule.lineupCount}
+                                                        onChange={e => setMultiStackRules(prev => prev.map(r => r.id === rule.id ? {...r, lineupCount: parseInt(e.target.value) || 1} : r))}
+                                                        className="w-12 text-center text-white bg-transparent border border-[#223366] rounded px-1 outline-none" />
+                                                </div>
+                                                <div className="flex items-center gap-1 text-xs">
+                                                    <span className="text-[#8A9BBE]">Min unique:</span>
+                                                    <select value={rule.minUniquePlayers}
+                                                        onChange={e => setMultiStackRules(prev => prev.map(r => r.id === rule.id ? {...r, minUniquePlayers: parseInt(e.target.value)} : r))}
+                                                        className="text-white bg-transparent border border-[#223366] rounded px-1 outline-none text-xs"
+                                                        style={{background:'#132244'}}>
+                                                        {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
+                                                    </select>
+                                                </div>
+                                            </div>
+                                            {rule.status === 'error' && rule.errorMessage && (
+                                                <div className="px-4 py-2 text-xs text-[#EF4444] border-t border-[#1A2E55]">{rule.errorMessage}</div>
+                                            )}
+                                            {rule.reasoning && (
+                                                <div className="px-4 py-2 text-xs text-[#8A9BBE] border-t border-[#1A2E55] italic">{rule.reasoning}</div>
+                                            )}
+                                        </div>
+                                    ))}
+
+                                    {/* Generated Lineups */}
+                                    {allGeneratedLineups.length > 0 && (
+                                        <div className="mt-4">
+                                            {/* Filter tabs */}
+                                            <div className="flex gap-2 mb-3 overflow-x-auto pb-1">
+                                                <button onClick={() => setActiveStackFilter('all')}
+                                                    className="px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap"
+                                                    style={{background: activeStackFilter === 'all' ? 'rgba(255,184,0,0.2)' : '#132244', color: activeStackFilter === 'all' ? '#FFB800' : '#8A9BBE', border: '1px solid ' + (activeStackFilter === 'all' ? '#FFB800' : '#223366')}}>
+                                                    All ({allGeneratedLineups.length})
+                                                </button>
+                                                {multiStackRules.filter(r => r.status === 'generated').map(rule => (
+                                                    <button key={rule.id} onClick={() => setActiveStackFilter(rule.id)}
+                                                        className="px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap"
+                                                        style={{background: activeStackFilter === rule.id ? 'rgba(255,184,0,0.2)' : '#132244', color: activeStackFilter === rule.id ? '#FFB800' : '#8A9BBE', border: '1px solid ' + (activeStackFilter === rule.id ? '#FFB800' : '#223366')}}>
+                                                        {rule.team} ({rule.generatedLineups.length})
+                                                    </button>
+                                                ))}
+                                            </div>
+
+                                            {/* Lineup cards */}
+                                            <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(340px,1fr))', gap:'12px'}}>
+                                                {(activeStackFilter === 'all' ? allGeneratedLineups : allGeneratedLineups.filter(l => l.stackId === activeStackFilter)).map((luObj, i) => {
+                                                    const lu = luObj.lineup
+                                                    const teamName = luObj.team
+                                                    const totalSal = lu.reduce((s, p) => s + (p?.OperatorSalary || 0), 0)
+                                                    const totalProj = lu.reduce((s, p) => s + (p ? getProjection(p) : 0), 0)
+                                                    return (
+                                                        <div key={i} className="rounded-xl border border-[#223366] overflow-hidden" style={{background:'#0F1E38'}}>
+                                                            <div className="px-3 py-2 flex items-center justify-between border-b border-[#223366]" style={{background:'#1A2E55'}}>
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className="text-xs font-black text-[#8A9BBE]">#{i+1}</span>
+                                                                    {teamName && <span className="px-2 py-0.5 rounded text-xs font-bold" style={{background:'rgba(255,184,0,0.15)', color:'#FFB800'}}>{teamName}</span>}
+                                                                </div>
+                                                                <div className="flex items-center gap-3 text-xs">
+                                                                    <span className="text-[#8A9BBE]">${totalSal.toLocaleString()}</span>
+                                                                    <span className="text-[#FFB800] font-bold">{totalProj.toFixed(1)} pts</span>
+                                                                </div>
+                                                            </div>
+                                                            <div className="p-2 space-y-0.5">
+                                                                {slots.map((slot, si) => {
+                                                                    const p = lu[si]
+                                                                    const isStack = p?.Team === teamName
+                                                                    return (
+                                                                        <div key={si} className="flex items-center gap-2 px-2 py-1 rounded text-xs"
+                                                                            style={{background: isStack ? 'rgba(255,184,0,0.08)' : 'transparent'}}>
+                                                                            <span className="w-6 text-[#8A9BBE]">{slot}</span>
+                                                                            {p ? (
+                                                                                <>
+                                                                                    <span style={{flex:1, color: isStack ? '#FFB800' : 'white', fontWeight: isStack ? 700 : 400}}>{p.OperatorPlayerName}</span>
+                                                                                    <span className="text-[#8A9BBE]">{p.Team}</span>
+                                                                                    <span className="text-[#22C55E]">{getProjection(p).toFixed(1)}</span>
+                                                                                </>
+                                                                            ) : (
+                                                                                <span className="text-[#EF4444]">EMPTY</span>
+                                                                            )}
+                                                                        </div>
+                                                                    )
+                                                                })}
+                                                            </div>
+                                                        </div>
+                                                    )
+                                                })}
+                                            </div>
+
+                                            {/* Exposure summary */}
+                                            <div className="mt-4 rounded-xl border border-[#223366] overflow-hidden" style={{background:'#0F1E38'}}>
+                                                <div className="px-4 py-2 border-b border-[#223366]" style={{background:'#1A2E55'}}>
+                                                    <span className="text-xs font-black text-white">Player Exposure ({allGeneratedLineups.length} lineups)</span>
+                                                </div>
+                                                <div style={{display:'grid', gridTemplateColumns:'repeat(2,1fr)'}}>
+                                                    {(() => {
+                                                        const counts = {}
+                                                        allGeneratedLineups.forEach(luObj => luObj.lineup.forEach(p => {
+                                                            if (!p) return
+                                                            if (!counts[p.SlatePlayerID]) counts[p.SlatePlayerID] = { player: p, count: 0 }
+                                                            counts[p.SlatePlayerID].count++
+                                                        }))
+                                                        return Object.values(counts).sort((a, b) => b.count - a.count).slice(0, 30).map(({ player, count }) => (
+                                                            <div key={player.SlatePlayerID} className="flex items-center gap-2 px-3 py-1.5 border-b border-[#1A2E55] text-xs">
+                                                                <span className="text-[#8A9BBE] w-6">{player.OperatorPosition}</span>
+                                                                <span className="text-white flex-1 truncate">{player.OperatorPlayerName}</span>
+                                                                <span className="text-[#8A9BBE]">{player.Team}</span>
+                                                                <span className="text-[#FFB800] font-bold">{Math.round((count / allGeneratedLineups.length) * 100)}%</span>
+                                                            </div>
+                                                        ))
+                                                    })()}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Stack Assignment Modal */}
+                            {showStackModal && stackModalPlayer && (
+                                <div className="fixed inset-0 z-50 flex items-center justify-center" style={{background:'rgba(0,0,0,0.7)'}}>
+                                    <div className="w-80 rounded-2xl border border-[#223366] p-6" style={{background:'#0F1E38'}}>
+                                        <h3 className="text-sm font-black text-white mb-4">Add {stackModalPlayer.OperatorPlayerName} to stack:</h3>
+                                        <div className="space-y-2">
+                                            {multiStackRules.map(rule => (
+                                                <button key={rule.id}
+                                                    onClick={() => {
+                                                        const payload = { slatePlayerId: stackModalPlayer.SlatePlayerID, operatorPlayerName: stackModalPlayer.OperatorPlayerName, operatorPosition: stackModalPlayer.OperatorPosition, operatorSalary: stackModalPlayer.OperatorSalary }
+                                                        if (!rule.lockedPlayers.some(lp => getLockedId(lp) === stackModalPlayer.SlatePlayerID)) {
+                                                            setMultiStackRules(prev => prev.map(r => r.id === rule.id ? {...r, lockedPlayers: [...r.lockedPlayers, payload], team: r.team || stackModalPlayer.Team} : r))
+                                                        }
+                                                        setShowStackModal(false)
+                                                    }}
+                                                    className="w-full text-left px-3 py-2 rounded-lg text-xs text-white border border-[#223366] hover:border-[#FFB800] transition-all"
+                                                    style={{background:'#132244'}}>
+                                                    <span className="font-bold text-[#FFB800]">{rule.team || 'Unnamed'}</span>{' '}— {rule.lockedPlayers.length} players, {rule.lineupCount} lineups
+                                                </button>
+                                            ))}
+                                            <button
+                                                onClick={() => {
+                                                    const payload = { slatePlayerId: stackModalPlayer.SlatePlayerID, operatorPlayerName: stackModalPlayer.OperatorPlayerName, operatorPosition: stackModalPlayer.OperatorPosition, operatorSalary: stackModalPlayer.OperatorSalary }
+                                                    setMultiStackRules(prev => [...prev, { id: crypto.randomUUID(), team: stackModalPlayer.Team || '', lockedPlayers: [payload], lineupCount: 10, minUniquePlayers: 2, reasoning: '', source: 'manual', status: 'pending', errorMessage: '', generatedLineups: [] }])
+                                                    setShowStackModal(false)
+                                                }}
+                                                className="w-full px-3 py-2 rounded-lg text-xs font-bold border border-[#2DD4BF] text-[#2DD4BF]"
+                                                style={{background:'rgba(45,212,191,0.1)'}}>
+                                                + Create New Stack with this player
+                                            </button>
+                                        </div>
+                                        <button onClick={() => setShowStackModal(false)} className="mt-4 w-full text-xs text-[#8A9BBE] hover:text-white">Cancel</button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    {/* ──── END MULTI-STACK BUILDER ──────────────────────────── */}
 
                     {showAiPanel && (
                         <div className="mb-4 rounded-xl border border-[#223366] overflow-hidden"
@@ -2988,7 +4031,7 @@ export default function Optimizer() {
                     <div className="flex items-center gap-0 mb-3 border-b border-[#223366]">
                         {[
                             { id: 'all', label: 'ALL PLAYERS' },
-                            { id: 'excluded', label: `EXCLUDED${stackRules.excludedPlayers.length > 0 ? ` (${stackRules.excludedPlayers.length})` : ''}` },
+                            { id: 'excluded', label: `EXCLUDED${legacyRules.excludedPlayers.length > 0 ? ` (${legacyRules.excludedPlayers.length})` : ''}` },
                             { id: 'liked', label: `LIKED${likedPlayers.length > 0 ? ` (${likedPlayers.length})` : ''}` },
                         ].map(tab => (
                             <button
@@ -3143,6 +4186,7 @@ export default function Optimizer() {
                                                             : 'transparent'}>
                                                     <td className="px-3 py-1.5">
                                                         <div className="flex items-center gap-1">
+                                                            {/* Add to lineup */}
                                                             <button
                                                                 onClick={() => inLineup ? null : addPlayer(player)}
                                                                 className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
@@ -3153,82 +4197,53 @@ export default function Optimizer() {
                                                                 }}>
                                                                 {inLineup ? '✓' : '+'}
                                                             </button>
+                                                            {/* Add to stack */}
                                                             <button
-                                                                onClick={() => {
-                                                                    const isLocked = stackRules.lockedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID)
-                                                                    if (isLocked) {
-                                                                        setStackRules(prev => ({
-                                                                            ...prev,
-                                                                            lockedPlayers: prev.lockedPlayers.filter(p => p.SlatePlayerID !== player.SlatePlayerID)
-                                                                        }))
-                                                                        const newLineup = [...lineup]
-                                                                        const slotIndex = newLineup.findIndex(p => p?.SlatePlayerID === player.SlatePlayerID)
-                                                                        if (slotIndex !== -1) {
-                                                                            newLineup[slotIndex] = null
-                                                                            setLineup(newLineup)
-                                                                        }
-                                                                    } else {
-                                                                        setStackRules(prev => ({
-                                                                            ...prev,
-                                                                            lockedPlayers: [...prev.lockedPlayers, player]
-                                                                        }))
-                                                                        addPlayer(player)
-                                                                    }
-                                                                }}
-                                                                title="Lock player"
+                                                                onClick={() => setAssignModalPlayer(player)}
+                                                                title="Add to stack"
                                                                 className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
                                                                 style={{
-                                                                    background: stackRules.lockedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? 'rgba(255,184,0,0.2)' : 'transparent',
-                                                                    color: stackRules.lockedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '#FFB800' : '#8A9BBE',
+                                                                    background: multiStackRules.some(s => s.lockedPlayers.find(p => getLockedId(p) === player.SlatePlayerID)) ? 'rgba(34,197,94,0.2)' : 'transparent',
+                                                                    color: multiStackRules.some(s => s.lockedPlayers.find(p => getLockedId(p) === player.SlatePlayerID)) ? '#22C55E' : '#8A9BBE',
                                                                     border: '1px solid rgba(34,51,102,0.5)'
                                                                 }}>
-                                                                {stackRules.lockedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '🔒' : '🔓'}
+                                                                🔒
                                                             </button>
+                                                            {/* Pitcher pool */}
+                                                            {(player.OperatorPosition === 'SP' || player.OperatorPosition === 'RP') && (
+                                                                <button
+                                                                    onClick={() => addToPitcherPool(player)}
+                                                                    title="Add to pitcher pool"
+                                                                    className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
+                                                                    style={{
+                                                                        background: pitcherPool.find(p => p.SlatePlayerID === player.SlatePlayerID) ? 'rgba(255,184,0,0.2)' : 'transparent',
+                                                                        color: pitcherPool.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '#FFB800' : '#8A9BBE',
+                                                                        border: '1px solid rgba(34,51,102,0.5)'
+                                                                    }}>
+                                                                    ⚾
+                                                                </button>
+                                                            )}
+                                                            {/* Common pool */}
+                                                            {player.OperatorPosition !== 'SP' && player.OperatorPosition !== 'RP' && (
+                                                                <button
+                                                                    onClick={() => addToCommonPool(player)}
+                                                                    title="Add to common pool"
+                                                                    className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
+                                                                    style={{
+                                                                        background: commonPool.find(p => p.SlatePlayerID === player.SlatePlayerID) ? 'rgba(99,102,241,0.2)' : 'transparent',
+                                                                        color: commonPool.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '#818CF8' : '#8A9BBE',
+                                                                        border: '1px solid rgba(34,51,102,0.5)'
+                                                                    }}>
+                                                                    🎯
+                                                                </button>
+                                                            )}
+                                                            {/* Exclude */}
                                                             <button
                                                                 onClick={() => {
-                                                                    const isLiked = likedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID)
-                                                                    setLikedPlayers(isLiked
-                                                                        ? likedPlayers.filter(p => p.SlatePlayerID !== player.SlatePlayerID)
-                                                                        : [...likedPlayers, player]
-                                                                    )
-                                                                }}
-                                                                title="Like player"
-                                                                className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
-                                                                style={{
-                                                                    background: likedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? 'rgba(255,184,0,0.2)' : 'transparent',
-                                                                    color: likedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '#FFB800' : '#8A9BBE',
-                                                                    border: '1px solid rgba(34,51,102,0.5)'
-                                                                }}>
-                                                                👍
-                                                            </button>
-                                                            {player.OperatorPosition !== 'SP' && player.OperatorPosition !== 'RP' && (() => {
-                                                                const inFillPool = !!fillPool.find(p => p.SlatePlayerID === player.SlatePlayerID)
-                                                                return (
-                                                                    <button
-                                                                        onClick={() => {
-                                                                            setFillPool(inFillPool
-                                                                                ? fillPool.filter(p => p.SlatePlayerID !== player.SlatePlayerID)
-                                                                                : [...fillPool, player]
-                                                                            )
-                                                                        }}
-                                                                        title={inFillPool ? 'Remove from fill pool' : 'Add to fill pool'}
-                                                                        className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
-                                                                        style={{
-                                                                            background: inFillPool ? '#818CF8' : 'transparent',
-                                                                            color: inFillPool ? '#ffffff' : '#8A9BBE',
-                                                                            border: inFillPool ? '1px solid #818CF8' : '1px solid rgba(34,51,102,0.5)',
-                                                                            transform: inFillPool ? 'scale(1.1)' : 'scale(1)'
-                                                                        }}>
-                                                                        🎯
-                                                                    </button>
-                                                                )
-                                                            })()}
-                                                            <button
-                                                                onClick={() => {
-                                                                    const isExcluded = stackRules.excludedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID)
-                                                                    setStackRules(prev => ({
+                                                                    const inExcluded = legacyRules.excludedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID)
+                                                                    setLegacyRules(prev => ({
                                                                         ...prev,
-                                                                        excludedPlayers: isExcluded
+                                                                        excludedPlayers: inExcluded
                                                                             ? prev.excludedPlayers.filter(p => p.SlatePlayerID !== player.SlatePlayerID)
                                                                             : [...prev.excludedPlayers, player]
                                                                     }))
@@ -3236,8 +4251,8 @@ export default function Optimizer() {
                                                                 title="Exclude player"
                                                                 className="w-5 h-5 rounded flex items-center justify-center text-xs transition-all"
                                                                 style={{
-                                                                    background: stackRules.excludedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? 'rgba(239,68,68,0.2)' : 'transparent',
-                                                                    color: stackRules.excludedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '#EF4444' : '#8A9BBE',
+                                                                    background: legacyRules.excludedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? 'rgba(239,68,68,0.2)' : 'transparent',
+                                                                    color: legacyRules.excludedPlayers.find(p => p.SlatePlayerID === player.SlatePlayerID) ? '#EF4444' : '#8A9BBE',
                                                                     border: '1px solid rgba(34,51,102,0.5)'
                                                                 }}>
                                                                 ✕
@@ -3298,6 +4313,12 @@ export default function Optimizer() {
                                                             style={{ background: posBadgeStyle(player.OperatorPosition), color: posTextColor(player.OperatorPosition) }}>
                                                             {player.OperatorPosition}
                                                         </span>
+                                                        {sport === 'nfl' && ['RB', 'WR', 'TE'].includes(player.OperatorPosition) && (
+                                                            <span className="text-xs px-1 py-0 rounded ml-1"
+                                                                style={{ background: 'rgba(251,146,60,0.15)', color: '#FB923C', fontSize: '9px' }}>
+                                                                FLEX
+                                                            </span>
+                                                        )}
                                                     </td>
                                                     <td className="px-3 py-1.5 font-mono text-xs text-white">
                                                         ${player.OperatorSalary?.toLocaleString()}
@@ -3553,10 +4574,10 @@ export default function Optimizer() {
                                                 🔗 {stackTeam} stack
                                             </span>
                                         )}
-                                        {stackRules.lockedPlayers.length > 0 && (
+                                        {legacyRules.lockedPlayers.length > 0 && (
                                             <span className="text-xs px-2 py-0.5 rounded font-bold"
                                                 style={{ background: 'rgba(34,197,94,0.1)', color: '#22C55E' }}>
-                                                🔒 {stackRules.lockedPlayers.length} locked
+                                                🔒 {legacyRules.lockedPlayers.length} locked
                                             </span>
                                         )}
                                         {fillPool.length > 0 && (
@@ -3565,10 +4586,10 @@ export default function Optimizer() {
                                                 🎯 {fillPool.length} fill pool
                                             </span>
                                         )}
-                                        {stackRules.excludedPlayers.length > 0 && (
+                                        {legacyRules.excludedPlayers.length > 0 && (
                                             <span className="text-xs px-2 py-0.5 rounded font-bold"
                                                 style={{ background: 'rgba(239,68,68,0.1)', color: '#EF4444' }}>
-                                                ✕ {stackRules.excludedPlayers.length} excluded
+                                                ✕ {legacyRules.excludedPlayers.length} excluded
                                             </span>
                                         )}
                                         <span className="text-xs px-2 py-0.5 rounded font-bold"
@@ -3708,7 +4729,7 @@ export default function Optimizer() {
                                                                                 <div className="w-1.5 h-1.5 rounded-full shrink-0 bg-[#FFB800]"
                                                                                     title={`${lineupStackTeam} stack player`} />
                                                                             )}
-                                                                            {stackRules.lockedPlayers.find(lp => lp.SlatePlayerID === player.SlatePlayerID) && (
+                                                                            {legacyRules.lockedPlayers.find(lp => lp.SlatePlayerID === player.SlatePlayerID) && (
                                                                                 <span className="text-xs shrink-0" title="Locked">🔒</span>
                                                                             )}
                                                                             {fillPool.find(fp => fp.SlatePlayerID === player.SlatePlayerID) && (
@@ -3830,10 +4851,10 @@ export default function Optimizer() {
                                             {' '}{stackFilter} lineups
                                         </div>
                                     )}
-                                    {stackRules.lockedPlayers.length > 0 && (
+                                    {legacyRules.lockedPlayers.length > 0 && (
                                         <div className="mt-2 flex items-center gap-1.5 text-xs text-[#8A9BBE]">
                                             <span>🔒</span>
-                                            <span>{stackRules.lockedPlayers.length} locked players in all lineups</span>
+                                            <span>{legacyRules.lockedPlayers.length} locked players in all lineups</span>
                                         </div>
                                     )}
                                 </div>
@@ -4121,19 +5142,19 @@ export default function Optimizer() {
                 )}
             </div>
 
-            {/* Game Filters Overlay */}
+            {/* Stack Builder Panel */}
             {showGameFilters && (
                 <>
                     <div className="fixed inset-0 z-40" style={{ background: 'rgba(0,0,0,0.5)' }}
                         onClick={() => setShowGameFilters(false)} />
 
                     <div className="fixed top-0 right-0 bottom-0 z-50 flex flex-col border-l border-[#223366] overflow-hidden"
-                        style={{ background: '#0F1E38', width: '420px' }}>
+                        style={{ background: '#0F1E38', width: '460px' }}>
 
                         {/* Panel Header */}
                         <div className="flex items-center justify-between px-5 py-4 border-b border-[#223366]"
                             style={{ background: '#1A2E55' }}>
-                            <div className="text-base font-black text-white">⚙️ Game Filters</div>
+                            <div className="text-base font-black text-white">🔗 Stack Builder</div>
                             <button onClick={() => setShowGameFilters(false)}
                                 className="text-[#8A9BBE] hover:text-white transition-colors text-xl w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#223366]">
                                 ✕
@@ -4143,24 +5164,279 @@ export default function Optimizer() {
                         {/* Tabs */}
                         <div className="flex border-b border-[#223366] shrink-0">
                             {[
+                                { id: 'stacks', label: '🔗 Stacks', badge: multiStackRules.length || null },
+                                { id: 'pitchers', label: '⚾ Pitchers', badge: pitcherPool.length || null },
+                                { id: 'common', label: '🎯 Common Pool', badge: commonPool.length || null },
                                 { id: 'rules', label: '⚙️ Rules' },
-                                { id: 'stack', label: '🔗 Stack' },
-                                { id: 'fillpool', label: '🎯 Fill Pool' },
                             ].map(tab => (
                                 <button key={tab.id} onClick={() => setGameFiltersTab(tab.id)}
-                                    className="flex-1 py-3 text-xs font-bold border-b-2 transition-all"
+                                    className="flex-1 py-3 text-xs font-bold border-b-2 transition-all relative"
                                     style={{
                                         borderColor: gameFiltersTab === tab.id ? '#FFB800' : 'transparent',
                                         color: gameFiltersTab === tab.id ? '#FFB800' : '#8A9BBE',
                                         background: gameFiltersTab === tab.id ? 'rgba(255,184,0,0.05)' : 'transparent'
                                     }}>
                                     {tab.label}
+                                    {tab.badge > 0 && (
+                                        <span className="ml-1 px-1 rounded-full text-xs font-black"
+                                            style={{ background: '#FFB800', color: '#0A1628', fontSize: '10px' }}>
+                                            {tab.badge}
+                                        </span>
+                                    )}
                                 </button>
                             ))}
                         </div>
 
                         {/* Tab Content */}
-                        <div className="flex-1 overflow-y-auto p-5">
+                        <div className="flex-1 overflow-y-auto p-4">
+
+                            {/* STACKS TAB */}
+                            {gameFiltersTab === 'stacks' && (
+                                <div className="space-y-3">
+                                    {sport === 'nfl' && (
+                                        <div className="mb-1 p-3 rounded-xl border border-[#223366]" style={{ background: '#132244' }}>
+                                            <div className="text-xs font-bold text-[#FFB800] mb-1">🏈 NFL Stack Logic</div>
+                                            <div className="text-xs text-[#8A9BBE]">
+                                                Click 🔒 on a QB in the player pool to start a stack, then add WR/TE teammates
+                                                to the same stack. The optimizer requires that QB plus 2+ pass catchers from
+                                                his team, and will look to bring back a pass catcher from the opposing team.
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div className="flex items-center justify-between">
+                                        <div className="text-xs text-[#8A9BBE]">Each stack locks players into lineups and generates them separately.</div>
+                                        <button
+                                            onClick={() => addStack('', null)}
+                                            className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all shrink-0"
+                                            style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800', border: '1px solid rgba(255,184,0,0.3)' }}>
+                                            + Add Stack
+                                        </button>
+                                    </div>
+
+                                    {multiStackRules.length === 0 ? (
+                                        <div className="text-center py-10 rounded-xl border border-dashed border-[#223366]">
+                                            <div className="text-3xl mb-2">🔗</div>
+                                            <div className="text-sm font-bold text-white mb-1">No stacks yet</div>
+                                            <div className="text-xs text-[#8A9BBE] mb-3">Click + Add Stack or use 🔒 on a player</div>
+                                            <button
+                                                onClick={() => addStack('', null)}
+                                                className="px-4 py-2 rounded-lg text-xs font-bold"
+                                                style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800', border: '1px solid rgba(255,184,0,0.3)' }}>
+                                                + Add Stack
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        multiStackRules.map((rule, idx) => (
+                                            <div key={rule.id} className="p-3 rounded-xl border"
+                                                style={{
+                                                    background: '#0A1628',
+                                                    borderColor: rule.status === 'done' ? '#22C55E' : rule.status === 'generating' ? '#FFB800' : '#223366'
+                                                }}>
+                                                {/* Stack header */}
+                                                <div className="flex items-center gap-2 mb-2">
+                                                    <div className="text-xs text-[#8A9BBE] shrink-0">#{idx + 1}</div>
+                                                    <input
+                                                        value={rule.team}
+                                                        onChange={e => updateStack(rule.id, { team: e.target.value.toUpperCase() })}
+                                                        placeholder="TEAM"
+                                                        className="w-16 px-2 py-1 rounded text-xs font-black text-center outline-none border border-[#223366] focus:border-[#FFB800] text-white uppercase"
+                                                        style={{ background: '#132244' }}
+                                                        maxLength={4}
+                                                    />
+                                                    <div className="flex items-center gap-1 ml-1">
+                                                        <span className="text-xs text-[#8A9BBE]">Lineups:</span>
+                                                        <input
+                                                            type="number"
+                                                            value={rule.lineupCount}
+                                                            onChange={e => updateStack(rule.id, { lineupCount: Math.max(1, parseInt(e.target.value) || 1) })}
+                                                            className="w-12 px-1 py-1 rounded text-xs font-bold text-center outline-none border border-[#223366] focus:border-[#FFB800] text-white"
+                                                            style={{ background: '#132244' }}
+                                                            min={1}
+                                                        />
+                                                    </div>
+                                                    <div className="flex items-center gap-1">
+                                                        <span className="text-xs text-[#8A9BBE]">Min unique:</span>
+                                                        <input
+                                                            type="number"
+                                                            value={rule.minUniquePlayers}
+                                                            onChange={e => updateStack(rule.id, { minUniquePlayers: Math.max(1, parseInt(e.target.value) || 1) })}
+                                                            className="w-10 px-1 py-1 rounded text-xs font-bold text-center outline-none border border-[#223366] focus:border-[#FFB800] text-white"
+                                                            style={{ background: '#132244' }}
+                                                            min={1}
+                                                        />
+                                                    </div>
+                                                    <button
+                                                        onClick={() => removeStack(rule.id)}
+                                                        className="ml-auto text-[#8A9BBE] hover:text-[#EF4444] transition-colors text-xs shrink-0">
+                                                        ✕
+                                                    </button>
+                                                </div>
+
+                                                {/* Locked players */}
+                                                <div className="flex flex-wrap gap-1 mb-2 min-h-[24px]">
+                                                    {rule.lockedPlayers.length === 0 ? (
+                                                        <div className="text-xs text-[#8A9BBE] italic">No locked players — click 🔒 on any player</div>
+                                                    ) : rule.lockedPlayers.map(p => (
+                                                        <span key={getLockedId(p)}
+                                                            className="px-2 py-0.5 rounded-full text-xs font-semibold flex items-center gap-1"
+                                                            style={{ background: 'rgba(34,197,94,0.15)', color: '#22C55E', border: '1px solid rgba(34,197,94,0.3)' }}>
+                                                            {getLockedName(p)}
+                                                            <button onClick={() => removePlayerFromStack(rule.id, getLockedId(p))}
+                                                                className="hover:text-white">✕</button>
+                                                        </span>
+                                                    ))}
+                                                </div>
+
+                                                {/* Generate button */}
+                                                <div className="flex items-center gap-2">
+                                                    {rule.status === 'generated' && (
+                                                        <div className="text-xs text-[#22C55E] font-bold">
+                                                            ✓ {rule.generatedLineups?.length || 0} lineups generated
+                                                        </div>
+                                                    )}
+                                                    {rule.status === 'error' && (
+                                                        <div className="text-xs mt-1" style={{ color: '#EF4444' }}>
+                                                            ⚠ {rule.error || 'Error generating — check console'}
+                                                        </div>
+                                                    )}
+                                                    <button
+                                                        onClick={() => generateStack(rule.id)}
+                                                        disabled={rule.status === 'generating' || eligiblePool.length === 0}
+                                                        className="ml-auto px-4 py-1.5 rounded-lg text-xs font-black transition-all"
+                                                        style={{
+                                                            background: rule.status === 'generating' ? 'rgba(255,184,0,0.1)' : 'linear-gradient(135deg, #FFB800, #E6A500)',
+                                                            color: rule.status === 'generating' ? '#FFB800' : '#0A1628',
+                                                            opacity: eligiblePool.length === 0 ? 0.5 : 1
+                                                        }}>
+                                                        {rule.status === 'generating'
+                                                            ? '⚡ Generating...'
+                                                            : rule.status === 'generated'
+                                                                ? `✓ ${rule.generatedLineups?.length || 0} done`
+                                                                : '▶ Generate'
+                                                        }
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+
+                                    {multiStackRules.length > 0 && (
+                                        <button
+                                            onClick={generateAllStacks}
+                                            disabled={multiStackRules.length === 0 || eligiblePool.length === 0 || multiStackRules.every(s => s.status === 'generated')}
+                                            className="w-full py-3 rounded-xl text-sm font-black transition-all"
+                                            style={{
+                                                background: 'linear-gradient(135deg, #FFB800, #E6A500)',
+                                                color: '#0A1628',
+                                                opacity: multiStackRules.length === 0 ? 0.5 : 1
+                                            }}>
+                                            ▶ Generate All Stacks ({multiStackRules.filter(s => s.status !== 'generated').length} pending)
+                                        </button>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* PITCHERS TAB */}
+                            {gameFiltersTab === 'pitchers' && (
+                                <div className="space-y-3">
+                                    <div className="text-xs text-[#8A9BBE]">
+                                        Whitelist pitchers eligible for generated lineups. Click ⚾ on any pitcher in the player table. If empty, all pitchers are eligible.
+                                    </div>
+
+                                    {pitcherPool.length === 0 ? (
+                                        <div className="text-center py-10 rounded-xl border border-dashed border-[#223366]">
+                                            <div className="text-3xl mb-2">⚾</div>
+                                            <div className="text-sm font-bold text-white mb-1">No pitcher pool set</div>
+                                            <div className="text-xs text-[#8A9BBE]">Click ⚾ on any SP/RP in the player table</div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="flex items-center justify-between">
+                                                <div className="text-xs font-bold text-[#FFB800]">{pitcherPool.length} pitchers in pool</div>
+                                                <button onClick={() => setPitcherPool([])} className="text-xs text-[#EF4444] hover:underline">Clear All</button>
+                                            </div>
+                                            <div className="space-y-2">
+                                                {pitcherPool.map(player => (
+                                                    <div key={player.SlatePlayerID}
+                                                        className="p-3 rounded-xl border border-[#223366]"
+                                                        style={{ background: '#0A1628' }}>
+                                                        <div className="flex items-center gap-2 mb-2">
+                                                            <div className="flex-1 min-w-0">
+                                                                <div className="text-xs font-bold text-white truncate">{player.OperatorPlayerName}</div>
+                                                                <div className="text-xs text-[#8A9BBE]">{player.Team} · {player.OperatorPosition} · ${player.OperatorSalary?.toLocaleString()}</div>
+                                                            </div>
+                                                            <button onClick={() => setPitcherPool(prev => prev.filter(p => p.SlatePlayerID !== player.SlatePlayerID))}
+                                                                className="text-[#8A9BBE] hover:text-[#EF4444] text-xs shrink-0">✕</button>
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="text-xs text-[#8A9BBE]">Max exposure:</span>
+                                                            <input
+                                                                type="range" min="5" max="100" step="5"
+                                                                value={player.maxExposurePct || 35}
+                                                                onChange={e => setPitcherPool(prev => prev.map(p => p.SlatePlayerID === player.SlatePlayerID ? { ...p, maxExposurePct: parseInt(e.target.value) } : p))}
+                                                                className="flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
+                                                                style={{ background: `linear-gradient(to right, #FFB800 0%, #FFB800 ${player.maxExposurePct || 35}%, #223366 ${player.maxExposurePct || 35}%, #223366 100%)` }}
+                                                            />
+                                                            <span className="text-xs font-bold text-[#FFB800] w-8 text-right">{player.maxExposurePct || 35}%</span>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* COMMON POOL TAB */}
+                            {gameFiltersTab === 'common' && (
+                                <div className="space-y-3">
+                                    <div className="text-xs text-[#8A9BBE]">
+                                        Hitters eligible to appear across all stacks. Click 🎯 on any hitter in the player table. If empty, full hitter pool is used.
+                                    </div>
+
+                                    {commonPool.length === 0 ? (
+                                        <div className="text-center py-10 rounded-xl border border-dashed border-[#223366]">
+                                            <div className="text-3xl mb-2">🎯</div>
+                                            <div className="text-sm font-bold text-white mb-1">No common pool set</div>
+                                            <div className="text-xs text-[#8A9BBE]">Click 🎯 on any hitter in the player table</div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="flex items-center justify-between">
+                                                <div className="text-xs font-bold text-[#818CF8]">{commonPool.length} players in common pool</div>
+                                                <button onClick={() => setCommonPool([])} className="text-xs text-[#EF4444] hover:underline">Clear All</button>
+                                            </div>
+                                            <div className="space-y-2">
+                                                {commonPool.map(player => (
+                                                    <div key={player.SlatePlayerID}
+                                                        className="p-3 rounded-xl border border-[#223366]"
+                                                        style={{ background: '#0A1628' }}>
+                                                        <div className="flex items-center gap-2 mb-2">
+                                                            <div className="flex-1 min-w-0">
+                                                                <div className="text-xs font-bold text-white truncate">{player.OperatorPlayerName}</div>
+                                                                <div className="text-xs text-[#8A9BBE]">{player.Team} · {player.OperatorPosition} · ${player.OperatorSalary?.toLocaleString()}</div>
+                                                            </div>
+                                                            <button onClick={() => setCommonPool(prev => prev.filter(p => p.SlatePlayerID !== player.SlatePlayerID))}
+                                                                className="text-[#8A9BBE] hover:text-[#EF4444] text-xs shrink-0">✕</button>
+                                                        </div>
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="text-xs text-[#8A9BBE]">Max exposure:</span>
+                                                            <input
+                                                                type="range" min="5" max="100" step="5"
+                                                                value={player.maxExposurePct || 50}
+                                                                onChange={e => setCommonPool(prev => prev.map(p => p.SlatePlayerID === player.SlatePlayerID ? { ...p, maxExposurePct: parseInt(e.target.value) } : p))}
+                                                                className="flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
+                                                                style={{ background: `linear-gradient(to right, #818CF8 0%, #818CF8 ${player.maxExposurePct || 50}%, #223366 ${player.maxExposurePct || 50}%, #223366 100%)` }}
+                                                            />
+                                                            <span className="text-xs font-bold text-[#818CF8] w-8 text-right">{player.maxExposurePct || 50}%</span>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
 
                             {/* RULES TAB */}
                             {gameFiltersTab === 'rules' && (
@@ -4269,12 +5545,12 @@ export default function Optimizer() {
                                                 <div className="text-xs font-bold text-white mb-2">Min from same team</div>
                                                 <div className="flex gap-1">
                                                     {[0,2,3,4].map(n => (
-                                                        <button key={n} onClick={() => setStackRules(prev => ({ ...prev, minFromSameTeam: n }))}
+                                                        <button key={n} onClick={() => setLegacyRules(prev => ({ ...prev, minFromSameTeam: n }))}
                                                             className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
                                                             style={{
-                                                                background: stackRules.minFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                                borderColor: stackRules.minFromSameTeam === n ? '#FFB800' : '#223366',
-                                                                color: stackRules.minFromSameTeam === n ? '#FFB800' : '#8A9BBE'
+                                                                background: legacyRules.minFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                                borderColor: legacyRules.minFromSameTeam === n ? '#FFB800' : '#223366',
+                                                                color: legacyRules.minFromSameTeam === n ? '#FFB800' : '#8A9BBE'
                                                             }}>{n}</button>
                                                     ))}
                                                 </div>
@@ -4283,12 +5559,12 @@ export default function Optimizer() {
                                                 <div className="text-xs font-bold text-white mb-2">Max from same team</div>
                                                 <div className="flex gap-1">
                                                     {[3,4,5,6].map(n => (
-                                                        <button key={n} onClick={() => setStackRules(prev => ({ ...prev, maxFromSameTeam: n }))}
+                                                        <button key={n} onClick={() => setLegacyRules(prev => ({ ...prev, maxFromSameTeam: n }))}
                                                             className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
                                                             style={{
-                                                                background: stackRules.maxFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                                borderColor: stackRules.maxFromSameTeam === n ? '#FFB800' : '#223366',
-                                                                color: stackRules.maxFromSameTeam === n ? '#FFB800' : '#8A9BBE'
+                                                                background: legacyRules.maxFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                                borderColor: legacyRules.maxFromSameTeam === n ? '#FFB800' : '#223366',
+                                                                color: legacyRules.maxFromSameTeam === n ? '#FFB800' : '#8A9BBE'
                                                             }}>{n}</button>
                                                     ))}
                                                 </div>
@@ -4296,33 +5572,16 @@ export default function Optimizer() {
                                         </div>
                                     </div>
 
-                                    {stackRules.lockedPlayers.length > 0 && (
-                                        <div className="pb-4 border-b border-[#223366]">
-                                            <div className="text-xs text-[#22C55E] font-bold mb-2">🔒 Locked Players</div>
-                                            <div className="flex flex-wrap gap-1">
-                                                {stackRules.lockedPlayers.map(p => (
-                                                    <span key={p.SlatePlayerID}
-                                                        className="px-2 py-1 rounded text-xs font-semibold flex items-center gap-1"
-                                                        style={{ background: 'rgba(34,197,94,0.1)', color: '#22C55E', border: '1px solid rgba(34,197,94,0.3)' }}>
-                                                        {p.OperatorPlayerName}
-                                                        <button onClick={() => setStackRules(prev => ({ ...prev, lockedPlayers: prev.lockedPlayers.filter(lp => lp.SlatePlayerID !== p.SlatePlayerID) }))}
-                                                            className="hover:text-white ml-1">✕</button>
-                                                    </span>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {stackRules.excludedPlayers.length > 0 && (
+                                    {legacyRules.excludedPlayers.length > 0 && (
                                         <div className="pb-4 border-b border-[#223366]">
                                             <div className="text-xs text-[#EF4444] font-bold mb-2">✕ Excluded Players</div>
                                             <div className="flex flex-wrap gap-1">
-                                                {stackRules.excludedPlayers.map(p => (
+                                                {legacyRules.excludedPlayers.map(p => (
                                                     <span key={p.SlatePlayerID}
                                                         className="px-2 py-1 rounded text-xs font-semibold flex items-center gap-1"
                                                         style={{ background: 'rgba(239,68,68,0.1)', color: '#EF4444', border: '1px solid rgba(239,68,68,0.3)' }}>
                                                         {p.OperatorPlayerName}
-                                                        <button onClick={() => setStackRules(prev => ({ ...prev, excludedPlayers: prev.excludedPlayers.filter(ep => ep.SlatePlayerID !== p.SlatePlayerID) }))}
+                                                        <button onClick={() => setLegacyRules(prev => ({ ...prev, excludedPlayers: prev.excludedPlayers.filter(ep => ep.SlatePlayerID !== p.SlatePlayerID) }))}
                                                             className="hover:text-white ml-1">✕</button>
                                                     </span>
                                                 ))}
@@ -4332,7 +5591,7 @@ export default function Optimizer() {
 
                                     <button
                                         onClick={() => {
-                                            setStackRules({ minFromSameTeam: 0, maxFromSameTeam: 5, lockedPlayers: [], excludedPlayers: [] })
+                                            setLegacyRules(prev => ({ ...prev, minFromSameTeam: 0, maxFromSameTeam: 5, excludedPlayers: [] }))
                                             setUniquePlayersPerLineup(1)
                                             setTeamSalaryMin('49500')
                                             setTeamSalaryMax('50000')
@@ -4343,285 +5602,6 @@ export default function Optimizer() {
                                         className="text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors">
                                         ↺ Reset All Rules
                                     </button>
-                                </div>
-                            )}
-
-                            {/* STACK TAB */}
-                            {gameFiltersTab === 'stack' && (
-                                <div>
-                                    <div className="text-xs text-[#8A9BBE] mb-4">
-                                        Set what percentage of your {lineupCount} lineups should use each team as the primary stack of 5 hitters.
-                                    </div>
-
-                                    {/* Total Exposure Indicator */}
-                                    <div className="flex items-center justify-between mb-4 p-3 rounded-xl border"
-                                        style={{
-                                            background: '#0A1628',
-                                            borderColor: getExposureColor(getTotalExposure())
-                                        }}>
-                                        <div>
-                                            <div className="text-xs text-[#8A9BBE]">Total Exposure</div>
-                                            <div className="text-2xl font-black"
-                                                style={{ color: getExposureColor(getTotalExposure()) }}>
-                                                {getTotalExposure().toFixed(0)}%
-                                            </div>
-                                        </div>
-                                        <div className="text-right">
-                                            <div className="text-xs text-[#8A9BBE]">Lineups Assigned</div>
-                                            <div className="text-lg font-black text-white">
-                                                {Object.entries(stackExposures).reduce((sum, [team, pct]) =>
-                                                    sum + getLineupCountForTeam(team), 0
-                                                )} / {lineupCount}
-                                            </div>
-                                        </div>
-                                        <div>
-                                            {getTotalExposure() > 100 && (
-                                                <div className="text-xs text-[#EF4444] font-bold">⚠ Over 100%</div>
-                                            )}
-                                            {getTotalExposure() === 100 && (
-                                                <div className="text-xs text-[#22C55E] font-bold">✓ Perfect</div>
-                                            )}
-                                            {getTotalExposure() < 100 && getTotalExposure() > 0 && (
-                                                <div className="text-xs text-[#FFB800] font-bold">
-                                                    {(100 - getTotalExposure()).toFixed(0)}% unassigned
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-
-                                    {/* Exposure Bar */}
-                                    <div className="mb-4 h-3 rounded-full overflow-hidden flex"
-                                        style={{ background: '#223366' }}>
-                                        {Object.entries(stackExposures)
-                                            .filter(([_, pct]) => parseFloat(pct) > 0)
-                                            .map(([team, pct], i) => {
-                                                const colors = [
-                                                    '#FFB800', '#22C55E', '#818CF8', '#F472B6',
-                                                    '#FB923C', '#2DD4BF', '#EF4444', '#A78BFA'
-                                                ]
-                                                return (
-                                                    <div key={team}
-                                                        style={{
-                                                            width: `${Math.min(parseFloat(pct), 100)}%`,
-                                                            background: colors[i % colors.length],
-                                                            transition: 'width 0.3s ease'
-                                                        }}
-                                                        title={`${team}: ${pct}%`}
-                                                    />
-                                                )
-                                            })
-                                        }
-                                    </div>
-
-                                    {/* Quick Presets */}
-                                    <div className="flex gap-2 mb-4 flex-wrap">
-                                        <div className="text-xs text-[#8A9BBE] w-full">Quick distribute:</div>
-                                        {[
-                                            {
-                                                label: 'Equal Split', action: () => {
-                                                    const teams = getTeams()
-                                                    const pct = (100 / teams.length).toFixed(1)
-                                                    const newExp = {}
-                                                    teams.forEach(t => newExp[t] = pct)
-                                                    setStackExposures(newExp)
-                                                }
-                                            },
-                                            { label: 'Clear All', action: () => setStackExposures({}) },
-                                            {
-                                                label: 'Top 3 Only', action: () => {
-                                                    const teams = getTeams().slice(0, 3)
-                                                    const newExp = {}
-                                                    teams.forEach((t, i) => newExp[t] = i === 0 ? '50' : i === 1 ? '30' : '20')
-                                                    setStackExposures(newExp)
-                                                }
-                                            },
-                                        ].map(preset => (
-                                            <button key={preset.label}
-                                                onClick={preset.action}
-                                                className="px-3 py-1 rounded-lg text-xs font-bold border border-[#223366] text-[#8A9BBE] hover:border-[#FFB800] hover:text-[#FFB800] transition-all"
-                                                style={{ background: '#0A1628' }}>
-                                                {preset.label}
-                                            </button>
-                                        ))}
-                                    </div>
-
-                                    {/* Team List */}
-                                    <div className="space-y-2">
-                                        {getTeams().map((team, teamIndex) => {
-                                            const pct = parseFloat(stackExposures[team]) || 0
-                                            const lineupCount4Team = getLineupCountForTeam(team)
-                                            const colors = [
-                                                '#FFB800', '#22C55E', '#818CF8', '#F472B6',
-                                                '#FB923C', '#2DD4BF', '#EF4444', '#A78BFA'
-                                            ]
-                                            const color = pct > 0 ? colors[
-                                                Object.keys(stackExposures)
-                                                    .filter(t => parseFloat(stackExposures[t]) > 0)
-                                                    .indexOf(team) % colors.length
-                                            ] : '#8A9BBE'
-
-                                            const teamHitters = players.filter(p =>
-                                                p.Team === team &&
-                                                p.OperatorPosition !== 'SP' &&
-                                                p.OperatorPosition !== 'RP'
-                                            )
-
-                                            return (
-                                                <div key={team}
-                                                    className="p-3 rounded-xl border transition-all"
-                                                    style={{
-                                                        background: pct > 0 ? 'rgba(255,184,0,0.03)' : '#0A1628',
-                                                        borderColor: pct > 0 ? color : '#223366'
-                                                    }}>
-                                                    <div className="flex items-center gap-3">
-
-                                                        {/* Team Name */}
-                                                        <div className="w-12 shrink-0">
-                                                            <div className="text-sm font-black"
-                                                                style={{ color: pct > 0 ? color : '#B8C5D6' }}>
-                                                                {team}
-                                                            </div>
-                                                            <div className="text-xs text-[#8A9BBE]">
-                                                                {teamHitters.length} hitters
-                                                            </div>
-                                                        </div>
-
-                                                        {/* Toggle */}
-                                                        <button
-                                                            onClick={() => {
-                                                                if (pct > 0) {
-                                                                    const newExp = { ...stackExposures }
-                                                                    delete newExp[team]
-                                                                    setStackExposures(newExp)
-                                                                } else {
-                                                                    setStackExposures(prev => ({
-                                                                        ...prev,
-                                                                        [team]: '20'
-                                                                    }))
-                                                                }
-                                                            }}
-                                                            className="w-10 h-5 rounded-full transition-all shrink-0 relative"
-                                                            style={{ background: pct > 0 ? color : '#223366' }}>
-                                                            <div className="w-4 h-4 rounded-full bg-white absolute top-0.5 transition-all"
-                                                                style={{ left: pct > 0 ? '22px' : '2px' }} />
-                                                        </button>
-
-                                                        {/* Percentage Slider + Input */}
-                                                        {pct > 0 ? (
-                                                            <div className="flex-1 flex items-center gap-2">
-                                                                <input
-                                                                    type="range"
-                                                                    min="0"
-                                                                    max="100"
-                                                                    step="5"
-                                                                    value={pct}
-                                                                    onChange={e => setStackExposures(prev => ({
-                                                                        ...prev,
-                                                                        [team]: e.target.value
-                                                                    }))}
-                                                                    className="flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
-                                                                    style={{
-                                                                        background: `linear-gradient(to right, ${color} 0%, ${color} ${pct}%, #223366 ${pct}%, #223366 100%)`
-                                                                    }}
-                                                                />
-                                                                <div className="flex items-center gap-1 shrink-0">
-                                                                    <input
-                                                                        type="number"
-                                                                        min="0"
-                                                                        max="100"
-                                                                        value={pct}
-                                                                        onChange={e => setStackExposures(prev => ({
-                                                                            ...prev,
-                                                                            [team]: e.target.value
-                                                                        }))}
-                                                                        className="w-12 px-1 py-0.5 rounded text-xs font-bold text-center outline-none border border-[#223366] text-white"
-                                                                        style={{ background: '#132244' }}
-                                                                    />
-                                                                    <span className="text-xs text-[#8A9BBE]">%</span>
-                                                                </div>
-                                                                <div className="text-xs shrink-0"
-                                                                    style={{ color, minWidth: '60px' }}>
-                                                                    {lineupCount4Team} lineups
-                                                                </div>
-                                                            </div>
-                                                        ) : (
-                                                            <div className="flex-1 text-xs text-[#8A9BBE]">
-                                                                Click toggle to include in stacks
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            )
-                                        })}
-                                    </div>
-
-                                    {/* Unassigned lineups note */}
-                                    {getTotalExposure() < 100 && getTotalExposure() > 0 && (
-                                        <div className="mt-3 p-3 rounded-lg border border-[#223366]"
-                                            style={{ background: '#0A1628' }}>
-                                            <div className="text-xs text-[#8A9BBE]">
-                                                <span className="text-[#FFB800] font-bold">
-                                                    {lineupCount - Object.entries(stackExposures).reduce(
-                                                        (sum, [t, p]) => sum + getLineupCountForTeam(t), 0
-                                                    )} lineups
-                                                </span> will use the best available stack from the full player pool
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-
-                            {/* FILL POOL TAB */}
-                            {gameFiltersTab === 'fillpool' && (
-                                <div>
-                                    <div className="text-xs text-[#8A9BBE] mb-4">
-                                        Players used to fill the 3 remaining slots outside your stack and pitchers. If empty, optimizer picks best available.
-                                    </div>
-
-                                    {fillPool.length === 0 ? (
-                                        <div className="text-center py-8 rounded-xl border border-dashed border-[#223366]">
-                                            <div className="text-3xl mb-2">🎯</div>
-                                            <div className="text-sm font-bold text-white mb-1">No players in fill pool</div>
-                                            <div className="text-xs text-[#8A9BBE]">Click the 🎯 icon on any hitter in the player table to add them</div>
-                                        </div>
-                                    ) : (
-                                        <>
-                                            <div className="flex items-center justify-between mb-3">
-                                                <div className="text-xs font-bold text-[#FFB800]">{fillPool.length} players in pool</div>
-                                                <button onClick={() => setFillPool([])} className="text-xs text-[#EF4444] hover:underline">Clear All</button>
-                                            </div>
-                                            <div className="space-y-1.5">
-                                                {fillPool.map((player, i) => (
-                                                    <div key={i} className="flex items-center gap-3 p-2.5 rounded-lg border border-[#223366]"
-                                                        style={{ background: '#132244' }}>
-                                                        <div className="flex-1 min-w-0">
-                                                            <div className="text-xs font-semibold text-white truncate">{player.OperatorPlayerName}</div>
-                                                            <div className="text-xs text-[#8A9BBE]">{player.Team} · {player.OperatorPosition}</div>
-                                                        </div>
-                                                        <div className="text-xs font-mono text-white shrink-0">${player.OperatorSalary?.toLocaleString()}</div>
-                                                        <div className="text-xs font-bold text-[#FFB800] shrink-0">
-                                                            {getProjection(player) > 0 ? getProjection(player).toFixed(1) : '—'}
-                                                        </div>
-                                                        <button onClick={() => setFillPool(fillPool.filter(p => p.SlatePlayerID !== player.SlatePlayerID))}
-                                                            className="text-[#8A9BBE] hover:text-red-400 transition-colors shrink-0">✕</button>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        </>
-                                    )}
-
-                                    <div className="mt-4 pt-4 border-t border-[#223366]">
-                                        <div className="flex items-center gap-2">
-                                            <div className="w-2 h-2 rounded-full shrink-0"
-                                                style={{ background: fillPool.length > 0 && stackTeam ? '#818CF8' : '#22C55E' }} />
-                                            <div className="text-xs text-[#8A9BBE]">
-                                                {fillPool.length > 0 && stackTeam
-                                                    ? `Fill pool active — ${fillPool.length} players for non-stack slots`
-                                                    : 'Using full player pool for non-stack slots'
-                                                }
-                                            </div>
-                                        </div>
-                                    </div>
                                 </div>
                             )}
                         </div>
@@ -4722,10 +5702,23 @@ export default function Optimizer() {
                             <div className="text-sm font-bold text-white mb-1">Click to upload CSV</div>
                             <div className="text-xs text-[#8A9BBE] text-center px-4">
                                 Supports DFF cheatsheet format with columns:<br />
-                                first_name, last_name, position, team, salary, ppg_projection
+                                {sport === 'nfl'
+                                    ? 'first_name, last_name, position, team, salary, ppg_projection, opp'
+                                    : 'first_name, last_name, position, team, salary, ppg_projection'}
                             </div>
                             <input type="file" accept=".csv" onChange={handleManualSlateUpload} className="hidden" />
                         </label>
+
+                        {sport === 'nfl' && (
+                            <div className="mt-4 p-3 rounded-lg border border-[#223366]"
+                                style={{ background: 'rgba(255,184,0,0.05)' }}>
+                                <div className="text-xs font-bold text-[#FFB800] mb-1">🏈 NFL position values</div>
+                                <div className="text-xs text-[#8A9BBE]">
+                                    position column: QB, RB, WR, TE, K, DST (or DEF / D/ST). For defense rows, first_name/last_name
+                                    can be left blank — the team name is used (e.g. &ldquo;Patriots D/ST&rdquo;).
+                                </div>
+                            </div>
+                        )}
 
                         <div className="mt-4 p-3 rounded-lg border border-[#223366]"
                             style={{ background: '#0A1628' }}>
@@ -4733,7 +5726,10 @@ export default function Optimizer() {
                                 Required Columns
                             </div>
                             <div className="flex flex-wrap gap-1">
-                                {['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection'].map(col => (
+                                {(sport === 'nfl'
+                                    ? ['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection', 'opp', 'ownership_projection']
+                                    : ['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection']
+                                ).map(col => (
                                     <span key={col} className="px-2 py-0.5 rounded text-xs font-mono"
                                         style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800' }}>
                                         {col}
@@ -4741,7 +5737,7 @@ export default function Optimizer() {
                                 ))}
                             </div>
                             <div className="text-xs text-[#8A9BBE] mt-2">
-                                Optional: opp, ownership_projection, value_projection, confirmed_order, over_under, implied_team_score
+                                Optional: {sport === 'nfl' ? 'value_projection, confirmed_order, over_under, spread' : 'opp, ownership_projection, value_projection, confirmed_order, over_under, implied_team_score'}
                             </div>
                         </div>
                     </div>
@@ -4813,6 +5809,93 @@ export default function Optimizer() {
                             }}>
                             Build {aiLineupCountInput} Lineups
                         </button>
+                    </div>
+                </div>
+            )}
+
+            {/* Stack Assignment Modal */}
+            {assignModalPlayer && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center"
+                    style={{ background: 'rgba(0,0,0,0.75)' }}>
+                    <div className="w-full max-w-sm p-6 rounded-2xl border border-[#223366] mx-4"
+                        style={{ background: '#132244' }}>
+                        <div className="flex items-center justify-between mb-4">
+                            <div>
+                                <div className="text-lg font-black text-white">🔒 Add to Stack</div>
+                                <div className="text-sm text-[#8A9BBE] mt-1">{assignModalPlayer.OperatorPlayerName}</div>
+                            </div>
+                            <button onClick={() => setAssignModalPlayer(null)}
+                                className="text-[#8A9BBE] hover:text-white text-xl w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#223366]">
+                                ✕
+                            </button>
+                        </div>
+
+                        {multiStackRules.length === 0 ? (
+                            <div className="text-center py-6">
+                                <div className="text-2xl mb-2">🔗</div>
+                                <div className="text-sm text-white mb-1">No stacks yet</div>
+                                <div className="text-xs text-[#8A9BBE] mb-4">Create a stack first, then assign players to it.</div>
+                                <button
+                                    onClick={() => {
+                                        const newId = addStack(assignModalPlayer.Team, assignModalPlayer)
+                                        setAssignModalPlayer(null)
+                                        setShowGameFilters(true)
+                                        setGameFiltersTab('stacks')
+                                    }}
+                                    className="px-4 py-2 rounded-lg text-sm font-bold"
+                                    style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800', border: '1px solid rgba(255,184,0,0.3)' }}>
+                                    + Create New Stack with this Player
+                                </button>
+                            </div>
+                        ) : (
+                            <>
+                                <div className="text-xs text-[#8A9BBE] mb-3">Select a stack to add this player to:</div>
+                                <div className="space-y-2 mb-4">
+                                    {multiStackRules.map((rule, idx) => {
+                                        const alreadyIn = rule.lockedPlayers.find(p => getLockedId(p) === assignModalPlayer.SlatePlayerID)
+                                        return (
+                                            <button
+                                                key={rule.id}
+                                                onClick={() => {
+                                                    if (!alreadyIn) addPlayerToStack(rule.id, assignModalPlayer)
+                                                    setAssignModalPlayer(null)
+                                                }}
+                                                disabled={!!alreadyIn}
+                                                className="w-full p-3 rounded-xl border text-left transition-all"
+                                                style={{
+                                                    background: alreadyIn ? 'rgba(34,197,94,0.08)' : '#0A1628',
+                                                    borderColor: alreadyIn ? '#22C55E' : '#223366',
+                                                    opacity: alreadyIn ? 0.7 : 1
+                                                }}>
+                                                <div className="flex items-center justify-between">
+                                                    <div>
+                                                        <div className="text-sm font-bold text-white">
+                                                            #{idx + 1} {rule.team || '—'}
+                                                        </div>
+                                                        <div className="text-xs text-[#8A9BBE]">
+                                                            {rule.lockedPlayers.length} locked · {rule.lineupCount} lineups
+                                                        </div>
+                                                    </div>
+                                                    <div className="text-xs font-bold"
+                                                        style={{ color: alreadyIn ? '#22C55E' : '#8A9BBE' }}>
+                                                        {alreadyIn ? '✓ Added' : '+ Add'}
+                                                    </div>
+                                                </div>
+                                            </button>
+                                        )
+                                    })}
+                                </div>
+                                <button
+                                    onClick={() => {
+                                        addStack(assignModalPlayer.Team, assignModalPlayer)
+                                        setAssignModalPlayer(null)
+                                    }}
+                                    className="w-full py-2 rounded-lg text-xs font-bold border transition-all"
+                                    style={{ background: 'transparent', color: '#FFB800', border: '1px solid rgba(255,184,0,0.3)' }}>
+                                    + Create New Stack with this Player
+                                </button>
+                            </>
+                        )}
                     </div>
                 </div>
             )}

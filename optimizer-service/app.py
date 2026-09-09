@@ -1,12 +1,38 @@
+import math
+import os
 import random
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ortools.sat.python import cp_model
 
 app = Flask(__name__)
-CORS(app)
+# flask-cors treats any origin string containing regex-hint characters (one of
+# ()\$]?^*[ ) as a regex it compiles itself — a plain "https://*.vercel.app"
+# string would be compiled as-is, and "*" right after "//" is a regex quantifier
+# on "/", not a glob wildcard, so it would never actually match a real preview
+# subdomain like "my-branch.vercel.app". Use a real (compiled) regex instead.
+_cors_origins = [
+    "http://localhost:3000",
+    re.compile(r"^https://.*\.vercel\.app$"),
+    "https://dfsszn.vercel.app",
+]
+_frontend_url = os.environ.get('FRONTEND_URL', '')
+if _frontend_url:
+    _cors_origins.append(_frontend_url)
+
+CORS(app, resources={r"/*": {"origins": _cors_origins}})
 
 SOLVER_TIME_LIMIT = 5.0
+
+def normalize_id(pid):
+    """Canonicalize a player ID so '123', 123, and 123.0 — int/float/string
+    forms that can arise from JS number handling or JSON round-tripping —
+    all compare equal against however the pool's own IDs happen to be typed."""
+    try:
+        return str(int(float(str(pid))))
+    except (TypeError, ValueError):
+        return str(pid)
 
 def compute_gpp_score(players):
     for p in players:
@@ -20,6 +46,10 @@ def compute_gpp_score(players):
             print(f"GPP score error for {p.get('operatorPlayerName')}: {e}")
             p['gpp_score'] = 0
     return players
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'service': 'dfsszn-optimizer'})
 
 @app.route('/optimize', methods=['POST'])
 def optimize():
@@ -63,6 +93,16 @@ def optimize():
         print(f"Stack distribution received: {stack_distribution[:10]}...")
         print(f"Unique stacks: {list(set(s for s in stack_distribution if s))}")
         fill_pool_ids = set(body.get('fillPoolIds', []))
+        # New multi-stack constraint fields
+        locked_player_ids = set(normalize_id(x) for x in body.get('lockedPlayerIds', []))
+        pitcher_pool_ids = set(str(x) for x in body.get('pitcherPoolIds', []))
+        common_pool_ids = set(str(x) for x in body.get('commonPoolIds', []))
+        print(f"Locked players: {locked_player_ids}")
+        print(f"Pitcher pool: {len(pitcher_pool_ids)} players")
+        print(f"Common pool: {len(common_pool_ids)} players")
+        global_exposure_caps = body.get('globalExposureCaps', {})
+        global_exposure_actual = {str(k): int(v) for k, v in body.get('globalExposureActual', {}).items()}
+        total_lineups_so_far = int(body.get('totalLineupsSoFar', 0))
         # ownership_targets: {slatePlayerId: target_pct}
         ownership_targets = body.get('ownershipTargets', {})
         print(f"Ownership targets received: {ownership_targets}")
@@ -136,6 +176,12 @@ def optimize():
                     return any(p in flex_pos for p in pos.split('/'))
                 return False
 
+            # NFL defense: DK labels it DST, FanDuel labels it DEF — accept either
+            # slot name for either label (roster-slot match above already covers
+            # this when operatorRosterSlots is populated; this is the fallback)
+            if slot in ['DST', 'DEF']:
+                return pos in ['DST', 'DEF', 'D/ST']
+
             # Multi-position players like "1B/C", "2B/3B", "3B/OF"
             if '/' in pos:
                 parts = [p.strip() for p in pos.split('/')]
@@ -153,10 +199,29 @@ def optimize():
 
             return False
 
+        # Detect NFL slates by the presence of NFL-only positions. NFL stacking
+        # (QB + pass catchers) and MLB stacking (5-hitter + catcher) are different
+        # enough that the stack constraint logic below branches on this.
+        is_nfl = any(
+            p.get('operatorPosition') in ['QB', 'RB', 'WR', 'TE', 'DST', 'DEF']
+            for p in players
+        )
+        print(f"Sport detected: {'NFL' if is_nfl else 'MLB'}")
+        # is_mlb also covers NBA (this optimizer never branched MLB vs NBA before
+        # the NFL work — NBA lineups fall through the same "not NFL" path they
+        # always did). Detection stays position-based rather than slot-based:
+        # slot strings collide across sports ('FLEX' is used by both NFL and NBA,
+        # 'C' means Catcher in MLB and Center in NBA), so a slots-only check
+        # would misclassify NBA slates as NFL/MLB. operatorPosition values
+        # (QB/RB/WR/TE/DST/DEF) are unambiguous across all three sports.
+        is_mlb = not is_nfl
+        stack_min_size = 3 if is_nfl else 5  # NFL: QB + 2 pass catchers minimum
+
         lineup_num = 0
         attempt = 0
         max_attempts = num_lineups * 40
         player_usage_count = {}
+        stack_team_usage = {}
         consecutive_failures = 0
         max_consecutive_failures = 100
 
@@ -172,6 +237,64 @@ def optimize():
                 current_stack = None
 
             print(f"\nLineup {lineup_num+1}/{num_lineups} | attempt {attempt} | stack: {current_stack}")
+
+            model = cp_model.CpModel()
+            vars_list = [model.NewBoolVar(f'p_{i}') for i in range(n)]
+
+            # Separate pitchers and hitters/skill players. NFL has no pitcher
+            # concept at all — every player is a "hitter" for the purposes of
+            # the slot/whitelist/stack logic below (explicit branch instead of
+            # relying on the generic filter finding zero matches, for clarity).
+            # Computed before the auto-stack selection below (which needs
+            # hitter_indices) and before opposing_team is resolved (which needs
+            # the final current_stack, auto-selected or not).
+            if is_nfl:
+                pitcher_indices = []
+                hitter_indices = list(range(n))
+            else:
+                pitcher_indices = [
+                    i for i, p in enumerate(players)
+                    if p.get('operatorPosition') in ['SP', 'RP', 'P']
+                    or 'P' in (p.get('operatorRosterSlots') or [])
+                ]
+                hitter_indices = [
+                    i for i, p in enumerate(players)
+                    if p.get('operatorPosition') not in ['SP', 'RP', 'P']
+                    and 'P' not in (p.get('operatorRosterSlots') or [])
+                ]
+            print(f"Pool: {len(pitcher_indices)} pitchers, {len(hitter_indices)} hitters/skill players")
+
+            # Auto-select a stack team for MLB when none was explicitly
+            # requested. Without this, an MLB lineup with no stack chosen
+            # optimizes with zero team correlation at all — every hitter
+            # picked independently. Scored by average projection, penalized
+            # by how often that team has already been used this batch (via
+            # stack_team_usage) so lineups don't all glom onto the same team,
+            # plus a little noise for variety between otherwise-similar teams.
+            if is_mlb and not current_stack:
+                team_projections = {}
+                for i in hitter_indices:
+                    team = players[i].get('team', '')
+                    proj = float(players[i].get('projectedPoints') or 0)
+                    if team:
+                        team_projections.setdefault(team, []).append(proj)
+
+                best_team = None
+                best_score = -999
+                for team, projs in team_projections.items():
+                    if len(projs) >= 4:
+                        avg = sum(projs) / len(projs)
+                        usage_penalty = stack_team_usage.get(team, 0) * 2
+                        noise = random.uniform(-1.5, 1.5)
+                        score = avg - usage_penalty + noise
+                        if score > best_score:
+                            best_score = score
+                            best_team = team
+
+                if best_team:
+                    current_stack = best_team
+                    print(f"Auto-stack: {current_stack} (score: {best_score:.1f}, "
+                          f"used: {stack_team_usage.get(best_team, 0)}x)")
 
             # Resolve opposing team for this lineup's specific stack
             opposing_team = None
@@ -200,25 +323,61 @@ def optimize():
 
                 print(f"Stack: {current_stack} vs {opposing_team or 'NOT FOUND'}")
 
-            model = cp_model.CpModel()
-            vars_list = [model.NewBoolVar(f'p_{i}') for i in range(n)]
-
-            # Lock required players
+            # Lock required players (old per-player locked flag)
             for i, p in enumerate(players):
                 if p['locked']:
                     model.Add(vars_list[i] == 1)
 
-            # Separate pitchers and hitters
-            pitcher_indices = [
+            # LOCKED PLAYERS — force x[i] = 1. Uses the same normalize_id() as
+            # locked_player_ids itself (previously this compared a raw,
+            # non-normalized str(slatePlayerId) against normalized IDs, so an
+            # int/float mismatch here could pass the constraint loop below but
+            # still fail this list — locked_indices also exempts these players
+            # from the common-pool whitelist further down, so a mismatch there
+            # could leave a player simultaneously forced to 1 and to 0).
+            locked_indices = [
                 i for i, p in enumerate(players)
-                if p.get('operatorPosition') in ['SP', 'RP', 'P']
-                or 'P' in (p.get('operatorRosterSlots') or [])
+                if p.get('slatePlayerId') is not None
+                and normalize_id(p.get('slatePlayerId')) in locked_player_ids
             ]
-            hitter_indices = [
-                i for i, p in enumerate(players)
-                if p.get('operatorPosition') not in ['SP', 'RP', 'P']
-                and 'P' not in (p.get('operatorRosterSlots') or [])
-            ]
+            if locked_player_ids:
+                locked_found = []
+                for i in locked_indices:
+                    model.Add(vars_list[i] == 1)
+                    locked_found.append(players[i].get('operatorPlayerName'))
+                print(f"Locked players found and constrained: {locked_found}")
+
+                found_ids = set(
+                    normalize_id(p.get('slatePlayerId'))
+                    for p in players
+                    if p.get('slatePlayerId') is not None
+                )
+                missing = locked_player_ids - found_ids
+                if missing:
+                    print(f"WARNING: Locked IDs not found in player pool: {missing}")
+                    print(f"Pool ID sample: {list(found_ids)[:5]}")
+
+            # PITCHER POOL WHITELIST
+            if pitcher_pool_ids:
+                for i in pitcher_indices:
+                    pid = str(players[i].get('slatePlayerId', ''))
+                    if pid not in pitcher_pool_ids:
+                        model.Add(vars_list[i] == 0)
+
+            # COMMON POOL WHITELIST (DST/DEF/K are unique single-copy positions —
+            # never let a whitelist built from hitters/pass-catchers exclude them)
+            if common_pool_ids:
+                for i in hitter_indices:
+                    pid = str(players[i].get('slatePlayerId', ''))
+                    # normalize_id() here, not the raw pid above, so this matches
+                    # the same locked_player_ids a mismatched int/float ID would
+                    # otherwise slip through — see locked_indices above.
+                    p_locked = normalize_id(players[i].get('slatePlayerId')) in locked_player_ids
+                    p_pos = players[i].get('operatorPosition', '')
+                    if p_pos in ['DST', 'DEF', 'K']:
+                        continue
+                    if not p_locked and pid not in common_pool_ids:
+                        model.Add(vars_list[i] == 0)
 
             # Stack-dependent index lists (recalculated each lineup after opposing_team is resolved)
             current_stack_indices = [
@@ -229,6 +388,7 @@ def optimize():
             opposing_hitter_indices = [
                 i for i in hitter_indices
                 if players[i].get('team') == opposing_team
+                and (not is_nfl or players[i].get('operatorPosition') in ['WR', 'TE', 'RB'])
             ] if opposing_team else []
 
             non_stack_non_opp_indices = [
@@ -237,13 +397,41 @@ def optimize():
                 and players[i].get('team') != opposing_team
             ] if current_stack else hitter_indices
 
-            if non_stack_non_opp_indices:
+            # MLB-only: feeds the "secondary hitter" objective boost below, which
+            # is skipped entirely for NFL (is_mlb-gated) — don't bother computing it.
+            best_secondary_idx = None
+            if is_mlb and non_stack_non_opp_indices:
                 best_secondary_idx = max(
                     non_stack_non_opp_indices,
                     key=lambda i: float(players[i].get('projectedPoints') or 0)
                 )
-            else:
-                best_secondary_idx = None
+
+            # Common pool whitelist: non-locked hitters must come from common pool
+            # (DST/DEF/K exempted — see COMMON POOL WHITELIST above)
+            if common_pool_ids:
+                for i in hitter_indices:
+                    pid = str(players[i].get('slatePlayerId', ''))
+                    p_pos = players[i].get('operatorPosition', '')
+                    if p_pos in ['DST', 'DEF', 'K']:
+                        continue
+                    if pid not in common_pool_ids and i not in locked_indices:
+                        model.Add(vars_list[i] == 0)
+
+            # Global exposure caps: exclude players who've hit their cap
+            if global_exposure_caps:
+                total_target = total_lineups_so_far + num_lineups
+                for pid_str, cap_pct in global_exposure_caps.items():
+                    current_count = global_exposure_actual.get(str(pid_str), 0)
+                    max_allowed = math.floor(float(cap_pct) / 100.0 * total_target)
+                    remaining_allowed = max_allowed - current_count
+                    player_idx = next(
+                        (i for i, p in enumerate(players)
+                         if str(p.get('slatePlayerId', '')) == str(pid_str)),
+                        None
+                    )
+                    if player_idx is not None and remaining_allowed <= 0:
+                        model.Add(vars_list[player_idx] == 0)
+                        print(f"Exposure cap: {pid_str} excluded ({current_count}/{max_allowed})")
 
             # Fill pool hitter indices (exclude current stack team)
             fill_pool_hitter_indices = [
@@ -269,25 +457,102 @@ def optimize():
             for slot in slots:
                 slot_counts[slot] = slot_counts.get(slot, 0) + 1
 
-            for slot, count in slot_counts.items():
-                if slot == 'P':
-                    eligible = pitcher_indices
-                elif current_stack:
-                    eligible = [
-                        i for i in hitter_indices
-                        if player_fits_slot(players[i], slot)
-                    ]
-                else:
-                    eligible = [
-                        i for i, p in enumerate(players)
-                        if player_fits_slot(p, slot)
-                    ]
+            if is_nfl:
+                # NFL's FLEX slot is RB/WR/TE-eligible, and every RB/WR/TE player
+                # is therefore ALSO FLEX-eligible (100% overlap, unlike MLB's rare
+                # multi-position tags). Giving each slot type its own independent
+                # "== count" constraint double-counts those overlapping players —
+                # selecting the required 2 RB + 3 WR + 1 TE already puts 6 players
+                # in the FLEX-eligible pool, which can never equal the FLEX slot's
+                # own "== 1" requirement. That contradiction made every NFL lineup
+                # with a FLEX slot INFEASIBLE.
+                #
+                # Fix: give RB/WR/TE a lower bound (">=" their own slot count) and
+                # let a single "==" constraint pin the TOTAL RB+WR+TE+FLEX pool
+                # to exactly how many skill slots exist — the solver is then free
+                # to decide which position supplies the extra FLEX body.
+                def slot_fail(slot_name):
+                    print(f"  Available positions: {sorted(set(p.get('operatorPosition', '') for p in players))}")
+                    return jsonify({'success': False, 'error': f'No players for slot {slot_name}'})
 
-                print(f"Slot {slot}: {len(eligible)} eligible (need {count})")
-                if not eligible:
-                    print(f"  Available positions: {[players[i].get('operatorPosition') for i in hitter_indices[:5]]}")
-                    return jsonify({'success': False, 'error': f'No players for slot {slot}'})
-                model.Add(sum(vars_list[i] for i in eligible) == count)
+                if 'QB' in slot_counts:
+                    qb_eligible = [i for i in range(n) if player_fits_slot(players[i], 'QB')]
+                    print(f"Slot QB: {len(qb_eligible)} eligible (need {slot_counts['QB']})")
+                    if not qb_eligible:
+                        return slot_fail('QB')
+                    model.Add(sum(vars_list[i] for i in qb_eligible) == slot_counts['QB'])
+
+                rb_count = slot_counts.get('RB', 0)
+                wr_count = slot_counts.get('WR', 0)
+                te_count = slot_counts.get('TE', 0)
+                flex_count = slot_counts.get('FLEX', 0)
+
+                if rb_count:
+                    rb_eligible = [i for i in range(n) if player_fits_slot(players[i], 'RB')]
+                    print(f"Slot RB: {len(rb_eligible)} eligible (need >= {rb_count})")
+                    if len(rb_eligible) < rb_count:
+                        return slot_fail('RB')
+                    model.Add(sum(vars_list[i] for i in rb_eligible) >= rb_count)
+
+                if wr_count:
+                    wr_eligible = [i for i in range(n) if player_fits_slot(players[i], 'WR')]
+                    print(f"Slot WR: {len(wr_eligible)} eligible (need >= {wr_count})")
+                    if len(wr_eligible) < wr_count:
+                        return slot_fail('WR')
+                    model.Add(sum(vars_list[i] for i in wr_eligible) >= wr_count)
+
+                if te_count:
+                    te_eligible = [i for i in range(n) if player_fits_slot(players[i], 'TE')]
+                    print(f"Slot TE: {len(te_eligible)} eligible (need >= {te_count})")
+                    if len(te_eligible) < te_count:
+                        return slot_fail('TE')
+                    model.Add(sum(vars_list[i] for i in te_eligible) >= te_count)
+
+                if flex_count:
+                    flex_eligible = [i for i in range(n) if player_fits_slot(players[i], 'FLEX')]
+                    skill_needed = rb_count + wr_count + te_count + flex_count
+                    print(f"Slot FLEX: {len(flex_eligible)} RB/WR/TE-eligible "
+                          f"(need == {skill_needed} total across RB+WR+TE+FLEX)")
+                    if len(flex_eligible) < skill_needed:
+                        return slot_fail('FLEX')
+                    model.Add(sum(vars_list[i] for i in flex_eligible) == skill_needed)
+
+                if 'K' in slot_counts:
+                    k_eligible = [i for i in range(n) if player_fits_slot(players[i], 'K')]
+                    print(f"Slot K: {len(k_eligible)} eligible (need {slot_counts['K']})")
+                    if not k_eligible:
+                        return slot_fail('K')
+                    model.Add(sum(vars_list[i] for i in k_eligible) == slot_counts['K'])
+
+                dst_slot = 'DST' if 'DST' in slot_counts else ('DEF' if 'DEF' in slot_counts else None)
+                if dst_slot:
+                    dst_eligible = [i for i in range(n) if player_fits_slot(players[i], dst_slot)]
+                    print(f"Slot {dst_slot}: {len(dst_eligible)} eligible (need {slot_counts[dst_slot]})")
+                    if not dst_eligible:
+                        return slot_fail(dst_slot)
+                    model.Add(sum(vars_list[i] for i in dst_eligible) == slot_counts[dst_slot])
+
+                print(f"NFL slot constraints applied: {slot_counts}")
+            else:
+                for slot, count in slot_counts.items():
+                    if slot == 'P':
+                        eligible = pitcher_indices
+                    elif current_stack:
+                        eligible = [
+                            i for i in hitter_indices
+                            if player_fits_slot(players[i], slot)
+                        ]
+                    else:
+                        eligible = [
+                            i for i, p in enumerate(players)
+                            if player_fits_slot(p, slot)
+                        ]
+
+                    print(f"Slot {slot}: {len(eligible)} eligible (need {count})")
+                    if not eligible:
+                        print(f"  Available positions: {[players[i].get('operatorPosition') for i in hitter_indices[:5]]}")
+                        return jsonify({'success': False, 'error': f'No players for slot {slot}'})
+                    model.Add(sum(vars_list[i] for i in eligible) == count)
 
             # Total player count
             model.Add(sum(vars_list) == len(slots))
@@ -315,92 +580,181 @@ def optimize():
                 if num_games > 2:
                     model.Add(sum(vars_list[i] for i in game_indices) <= safe_game_max)
 
-            # Stack constraint: >= stack_team_size hitters from current stack team
+            # Stack constraint: sport-aware. MLB stacks a 5-hitter core (+ catcher
+            # requirement); NFL stacks a QB with his own pass catchers instead.
             if current_stack and current_stack_indices:
-                actual_stack_size = min(
-                    stack_team_size if stack_team_size > 0 else 5,
-                    len(current_stack_indices)
-                )
-                model.Add(
-                    sum(vars_list[i] for i in current_stack_indices) >= actual_stack_size
-                )
-                print(f"Stack constraint: >= {actual_stack_size} from {current_stack}")
-
-                # Require a catcher from the stack team; fall back to SS if no catcher available
-                stack_c_indices = [
-                    i for i in current_stack_indices
-                    if 'C' in (players[i].get('operatorPosition') or '').split('/')
-                    or players[i].get('operatorPosition') == 'C'
-                ]
-                if len(stack_c_indices) > 0:
-                    model.Add(
-                        sum(vars_list[i] for i in stack_c_indices) >= 1
-                    )
-                    print(f"Catcher requirement: {len(stack_c_indices)} eligible catchers from {current_stack}")
-                else:
-                    stack_ss_indices = [
+                if is_nfl:
+                    qb_indices = [
                         i for i in current_stack_indices
-                        if 'SS' in (players[i].get('operatorPosition') or '').split('/')
-                        or players[i].get('operatorPosition') == 'SS'
+                        if players[i].get('operatorPosition') == 'QB'
                     ]
-                    if len(stack_ss_indices) > 0:
-                        model.Add(
-                            sum(vars_list[i] for i in stack_ss_indices) >= 1
-                        )
-                        print(f"No catcher on {current_stack}, using SS fallback: {len(stack_ss_indices)} eligible")
+                    # WR/TE/RB — a same-team RB can also count toward the
+                    # secondary-stack requirement (relaxed from WR/TE-only to
+                    # widen the eligible pool on slates with thin WR/TE depth)
+                    pass_catcher_indices = [
+                        i for i in current_stack_indices
+                        if players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
+                    ]
+                    print(f"NFL Stack {current_stack}: {len(qb_indices)} QB, "
+                          f"{len(pass_catcher_indices)} WR/TE/RB")
+
+                    if qb_indices:
+                        model.Add(sum(vars_list[i] for i in qb_indices) >= 1)
+                        print(f"QB constraint: 1 QB from {current_stack}")
+
+                    if len(pass_catcher_indices) >= 2:
+                        model.Add(sum(vars_list[i] for i in pass_catcher_indices) >= 2)
+                        print(f"Pass catcher constraint: 2+ WR/TE/RB from {current_stack}")
+                    elif len(pass_catcher_indices) == 1:
+                        model.Add(sum(vars_list[i] for i in pass_catcher_indices) >= 1)
+                        print(f"Pass catcher constraint (relaxed): 1+ WR/TE/RB from {current_stack}")
                     else:
-                        print(f"No catcher or SS available from {current_stack}, skipping that constraint")
+                        print(f"No WR/TE/RB available from {current_stack}, skipping pass-catcher constraint")
 
-            # Fill pool constraint: remaining hitter slots use fill pool
-            if fill_pool_ids and len(fill_pool_ids) > 0:
-                pitcher_slots = slots.count('P') if slots else 2
-                total_hitter_slots = len(slots) - pitcher_slots if slots else 8
-                stack_slots_used = 5 if current_stack else 0
-                bring_back_slots_used = (
-                    min(2, len(opposing_hitter_indices))
-                    if opposing_team and opposing_hitter_indices
-                    else 0
-                )
-                available_for_fill = total_hitter_slots - stack_slots_used - bring_back_slots_used
+                    # Anti-correlation: never roster the opposing team's DST against this stack
+                    if opposing_team:
+                        opp_dst_indices = [
+                            i for i in range(n)
+                            if players[i].get('team') == opposing_team
+                            and players[i].get('operatorPosition') in ['DST', 'DEF']
+                        ]
+                        for i in opp_dst_indices:
+                            model.Add(vars_list[i] == 0)
+                        if opp_dst_indices:
+                            print(f"Anti-corr DST: blocked {len(opp_dst_indices)} from {opposing_team}")
+                else:
+                    # Enforce a 4-5 hitter range rather than only a lower bound —
+                    # a bare ">=" let the solver treat the "stack" as a floor it
+                    # could blow past or barely touch, so two lineups both
+                    # "stacking" the same team could look nothing alike. Falls
+                    # back to a looser >=3 (or skips entirely) when the pool is
+                    # too thin for a full stack instead of forcing INFEASIBLE.
+                    print(f"Stack team {current_stack}: {len(current_stack_indices)} hitters available")
 
-                actual_fill_requirement = min(
-                    max(1, available_for_fill),
-                    len(fill_pool_hitter_indices)
-                )
+                    if len(current_stack_indices) >= 4:
+                        min_stack = 4
+                        max_stack = min(5, len(current_stack_indices))
+                        model.Add(
+                            sum(vars_list[i] for i in current_stack_indices) >= min_stack
+                        )
+                        model.Add(
+                            sum(vars_list[i] for i in current_stack_indices) <= max_stack
+                        )
+                        print(f"Stack constraint: {min_stack}-{max_stack} hitters from {current_stack}")
+                    elif len(current_stack_indices) >= 3:
+                        model.Add(
+                            sum(vars_list[i] for i in current_stack_indices) >= 3
+                        )
+                        print(f"Stack constraint: >= 3 from {current_stack} "
+                              f"(only {len(current_stack_indices)} available)")
+                    else:
+                        print(f"Warning: only {len(current_stack_indices)} hitters "
+                              f"from {current_stack} — skipping stack")
 
-                print(f"Fill pool: {len(fill_pool_hitter_indices)} eligible | "
-                      f"available slots after stack+bringback: {available_for_fill} | "
-                      f"requiring: {actual_fill_requirement}")
+                    # Require a catcher from the stack team; fall back to SS if no catcher available
+                    stack_c_indices = [
+                        i for i in current_stack_indices
+                        if 'C' in (players[i].get('operatorPosition') or '').split('/')
+                        or players[i].get('operatorPosition') == 'C'
+                    ]
+                    if len(stack_c_indices) > 0:
+                        model.Add(
+                            sum(vars_list[i] for i in stack_c_indices) >= 1
+                        )
+                        print(f"Catcher requirement: {len(stack_c_indices)} eligible catchers from {current_stack}")
+                    else:
+                        stack_ss_indices = [
+                            i for i in current_stack_indices
+                            if 'SS' in (players[i].get('operatorPosition') or '').split('/')
+                            or players[i].get('operatorPosition') == 'SS'
+                        ]
+                        if len(stack_ss_indices) > 0:
+                            model.Add(
+                                sum(vars_list[i] for i in stack_ss_indices) >= 1
+                            )
+                            print(f"No catcher on {current_stack}, using SS fallback: {len(stack_ss_indices)} eligible")
+                        else:
+                            print(f"No catcher or SS available from {current_stack}, skipping that constraint")
 
-                if actual_fill_requirement >= 1 and len(fill_pool_hitter_indices) >= actual_fill_requirement:
-                    model.Add(
-                        sum(vars_list[i] for i in fill_pool_hitter_indices) >= actual_fill_requirement
+            # Fill pool constraint: remaining hitter slots use fill pool. MLB-only —
+            # for a 9-slot NFL roster this math (e.g. stack_min_size=3 reserved for
+            # QB+2 catchers, forcing >=6 from "elsewhere" in the no-fill-pool
+            # fallback below) leaves zero slack against the QB/pass-catcher/
+            # bring-back requirements and was producing INFEASIBLE on most NFL
+            # slates. NFL has no fill-pool UI today, so nothing NFL-facing relies
+            # on this.
+            if is_mlb:
+                if fill_pool_ids and len(fill_pool_ids) > 0:
+                    pitcher_slots = slots.count('P') if slots else 2
+                    total_hitter_slots = len(slots) - pitcher_slots if slots else 8
+                    stack_slots_used = stack_min_size if current_stack else 0
+                    bring_back_slots_used = (
+                        min(2, len(opposing_hitter_indices))
+                        if opposing_team and opposing_hitter_indices
+                        else 0
                     )
-                elif actual_fill_requirement < 1:
-                    print(f"Fill pool skipped: no slots available after "
-                          f"stack({stack_slots_used}) + bring-back({bring_back_slots_used}) = "
-                          f"{stack_slots_used + bring_back_slots_used} of {total_hitter_slots} hitter slots")
-            elif current_stack:
-                pitcher_slot_count = slots.count('P')
-                hitter_slot_count = len(slots) - pitcher_slot_count
-                fill_slot_count = hitter_slot_count - 5
-                if fill_slot_count > 0:
-                    model.Add(
-                        sum(vars_list[i] for i in non_stack_hitter_indices) >= fill_slot_count
-                    )
-                    print(f"Non-stack constraint: >= {fill_slot_count} from non-stack teams")
+                    available_for_fill = total_hitter_slots - stack_slots_used - bring_back_slots_used
 
-            # Anti-correlation: pitchers should not pitch against current stack team
-            if current_stack:
-                bad_pitcher_indices = [
+                    actual_fill_requirement = min(
+                        max(1, available_for_fill),
+                        len(fill_pool_hitter_indices)
+                    )
+
+                    print(f"Fill pool: {len(fill_pool_hitter_indices)} eligible | "
+                          f"available slots after stack+bringback: {available_for_fill} | "
+                          f"requiring: {actual_fill_requirement}")
+
+                    if actual_fill_requirement >= 1 and len(fill_pool_hitter_indices) >= actual_fill_requirement:
+                        model.Add(
+                            sum(vars_list[i] for i in fill_pool_hitter_indices) >= actual_fill_requirement
+                        )
+                    elif actual_fill_requirement < 1:
+                        print(f"Fill pool skipped: no slots available after "
+                              f"stack({stack_slots_used}) + bring-back({bring_back_slots_used}) = "
+                              f"{stack_slots_used + bring_back_slots_used} of {total_hitter_slots} hitter slots")
+                elif current_stack:
+                    pitcher_slot_count = slots.count('P')
+                    hitter_slot_count = len(slots) - pitcher_slot_count
+                    fill_slot_count = hitter_slot_count - stack_min_size
+                    if fill_slot_count > 0:
+                        model.Add(
+                            sum(vars_list[i] for i in non_stack_hitter_indices) >= fill_slot_count
+                        )
+                        print(f"Non-stack constraint: >= {fill_slot_count} from non-stack teams")
+
+            # Anti-correlation: block pitchers FACING the stack team, not the
+            # stack team's own pitcher. The old check compared the pitcher's
+            # own team to current_stack, which blocked exactly the wrong
+            # pitcher — a team's own starter isn't anti-correlated with that
+            # team's hitters (they're never on the field at the same time in
+            # a way that makes one's success come at the other's expense);
+            # the pitcher who actually conflicts with a stack is whoever the
+            # stacked team is batting against, since a big offensive game
+            # from the stack implies a bad one from that pitcher.
+            # (MLB-only concept — pitcher_indices is always empty for NFL, so
+            # this was already a no-op there; is_mlb makes that explicit)
+            if is_mlb and current_stack:
+                stack_game_ids = set(
+                    players[j].get('slateGameId') for j in current_stack_indices
+                )
+                bad_pitchers = [
                     i for i in pitcher_indices
-                    if players[i].get('team') == current_stack
+                    if players[i].get('opponent') == current_stack
+                    or players[i].get('opp') == current_stack
+                    or (
+                        # Fallback when opponent/opp aren't populated: same
+                        # game as the stack, but not on the stack's own team.
+                        players[i].get('slateGameId') in stack_game_ids
+                        and players[i].get('team') != current_stack
+                    )
                 ]
-                remaining_pitchers = len(pitcher_indices) - len(bad_pitcher_indices)
+                remaining_pitchers = len(pitcher_indices) - len(bad_pitchers)
                 if remaining_pitchers >= 2:
-                    for i in bad_pitcher_indices:
+                    for i in bad_pitchers:
                         model.Add(vars_list[i] == 0)
-                    print(f"Anti-correlation: blocked {len(bad_pitcher_indices)} pitchers from {current_stack}")
+                    print(f"Anti-correlation: blocked {len(bad_pitchers)} pitchers facing {current_stack}")
+                else:
+                    print(f"Anti-correlation skipped: only {remaining_pitchers} pitchers would remain")
 
             # Bring-back constraint: 1-2 hitters from opposing team
             if current_stack and opposing_team:
@@ -424,39 +778,44 @@ def optimize():
             for prev in previous_lineups[-20:]:
                 model.Add(sum(vars_list[i] for i in prev) <= len(slots) - min_unique)
 
-            # Objective: maximize GPP score with secondary hitter boost and value weighting
+            # Objective: maximize GPP score with secondary hitter boost and value weighting.
+            # The three boosts below (secondary/bring-back/value) were tuned around
+            # MLB's 5-hitter-stack shape and its "secondary stack" concept — kept
+            # MLB-only (is_mlb) rather than reused as-is for NFL's different roster
+            # shape; NFL lineups score on gpp_score + usage penalty + noise only.
             objective_terms = []
             for i in range(n):
                 base_score = int((players[i].get('gpp_score', 0) or 0) * 100)
                 usage_penalty = player_usage_count.get(i, 0) * 15
                 random_noise = random.randint(-8, 8)
-
-                # Strongly prefer the single best non-stack hitter in remaining slots
                 secondary_boost = 0
-                if (current_stack and
-                        best_secondary_idx is not None and
-                        i == best_secondary_idx):
-                    secondary_boost = 500
-
-                # Prefer high-projection opposing team hitters for game-stack correlation
                 bring_back_boost = 0
-                if (opposing_team and
-                        players[i].get('team') == opposing_team and
-                        players[i].get('operatorPosition') not in ['SP', 'RP']):
-                    proj = float(players[i].get('projectedPoints') or 0)
-                    bring_back_boost = int(proj * 15)
-
-                # For other non-stack/non-bring-back hitters, weight by points-per-dollar
                 value_boost = 0
-                if (current_stack and
-                        players[i].get('team') != current_stack and
-                        players[i].get('team') != opposing_team and
-                        i != best_secondary_idx):
-                    salary = float(players[i].get('operatorSalary') or 1)
-                    proj = float(players[i].get('projectedPoints') or 0)
-                    if salary > 0:
-                        value_per_k = (proj / salary) * 1000
-                        value_boost = int(value_per_k * 20)
+
+                if is_mlb:
+                    # Strongly prefer the single best non-stack hitter in remaining slots
+                    if (current_stack and
+                            best_secondary_idx is not None and
+                            i == best_secondary_idx):
+                        secondary_boost = 500
+
+                    # Prefer high-projection opposing team hitters for game-stack correlation
+                    if (opposing_team and
+                            players[i].get('team') == opposing_team and
+                            players[i].get('operatorPosition') not in ['SP', 'RP']):
+                        proj = float(players[i].get('projectedPoints') or 0)
+                        bring_back_boost = int(proj * 15)
+
+                    # For other non-stack/non-bring-back hitters, weight by points-per-dollar
+                    if (current_stack and
+                            players[i].get('team') != current_stack and
+                            players[i].get('team') != opposing_team and
+                            i != best_secondary_idx):
+                        salary = float(players[i].get('operatorSalary') or 1)
+                        proj = float(players[i].get('projectedPoints') or 0)
+                        if salary > 0:
+                            value_per_k = (proj / salary) * 1000
+                            value_boost = int(value_per_k * 20)
 
                 adjusted_score = max(
                     base_score - usage_penalty + random_noise + secondary_boost + bring_back_boost + value_boost,
@@ -509,31 +868,55 @@ def optimize():
 
             if current_stack:
                 print(f"Stack hitters available: {len(current_stack_indices)}")
-                if len(current_stack_indices) < 5:
-                    print(f"!! INFEASIBLE: only {len(current_stack_indices)} hitters from {current_stack}, need 5")
-                stack_c = [
-                    i for i in current_stack_indices
-                    if 'C' in (players[i].get('operatorPosition') or '').split('/')
-                    or players[i].get('operatorPosition') == 'C'
-                ]
-                print(f"Stack catchers: {len(stack_c)}")
-                if len(stack_c) == 0:
-                    stack_ss = [
+                if len(current_stack_indices) < stack_min_size:
+                    print(f"!! INFEASIBLE: only {len(current_stack_indices)} from {current_stack}, need {stack_min_size}")
+                if is_nfl:
+                    stack_qb = [i for i in current_stack_indices if players[i].get('operatorPosition') == 'QB']
+                    stack_pc = [i for i in current_stack_indices if players[i].get('operatorPosition') in ['WR', 'TE']]
+                    print(f"Stack QB: {len(stack_qb)} | Stack WR/TE: {len(stack_pc)}")
+                    if not stack_qb:
+                        print(f"!! WARN: no QB from {current_stack}")
+                    if not stack_pc:
+                        print(f"!! WARN: no WR/TE from {current_stack}")
+                else:
+                    stack_c = [
                         i for i in current_stack_indices
-                        if players[i].get('operatorPosition') == 'SS'
+                        if 'C' in (players[i].get('operatorPosition') or '').split('/')
+                        or players[i].get('operatorPosition') == 'C'
                     ]
-                    print(f"Stack SS (fallback): {len(stack_ss)}")
-                    if len(stack_ss) == 0:
-                        print(f"!! WARN: no C or SS from {current_stack}")
+                    print(f"Stack catchers: {len(stack_c)}")
+                    if len(stack_c) == 0:
+                        stack_ss = [
+                            i for i in current_stack_indices
+                            if players[i].get('operatorPosition') == 'SS'
+                        ]
+                        print(f"Stack SS (fallback): {len(stack_ss)}")
+                        if len(stack_ss) == 0:
+                            print(f"!! WARN: no C or SS from {current_stack}")
 
             if opposing_team:
-                print(f"Bring-back hitters: {len(opposing_hitter_indices)}")
+                print(f"Bring-back {'pass catchers' if is_nfl else 'hitters'}: {len(opposing_hitter_indices)}")
                 if len(opposing_hitter_indices) < 1:
-                    print(f"!! WARN: no opposing hitters for bring-back")
+                    print(f"!! WARN: no opposing {'pass catchers' if is_nfl else 'hitters'} for bring-back")
 
-            hitter_slots_total = len([s for s in slots if s != 'P'])
-            stack_slots = 5
-            bring_back_slots = min(2, len(opposing_hitter_indices))
+            # This diagnostic estimates how many slots are "spoken for" by the
+            # stack/bring-back requirements vs. left open for everyone else.
+            # NFL no longer forces an exact partition here (see the fill-pool/
+            # non-stack fallback above, which is MLB-only), so there's nothing
+            # meaningful to subtract — report the full slot count instead of a
+            # stale MLB-shaped estimate that would falsely flag INFEASIBLE.
+            if is_nfl:
+                hitter_slots_total = len(slots)
+                stack_slots = 0
+                bring_back_slots = 0
+            else:
+                hitter_slots_total = len([s for s in slots if s != 'P'])
+                stack_slots = stack_min_size if current_stack else 0
+                bring_back_slots = (
+                    min(2, len(opposing_hitter_indices))
+                    if opposing_team and opposing_hitter_indices
+                    else 0
+                )
             remaining_slots = hitter_slots_total - stack_slots - bring_back_slots
             remaining_hitters = len([
                 i for i in hitter_indices
@@ -573,6 +956,8 @@ def optimize():
                 consecutive_failures = 0
                 for idx in selected_indices:
                     player_usage_count[idx] = player_usage_count.get(idx, 0) + 1
+                if is_mlb and current_stack:
+                    stack_team_usage[current_stack] = stack_team_usage.get(current_stack, 0) + 1
                 print(f"  ✓ Lineup {lineup_num} accepted with stack: {current_stack}")
             else:
                 print(f"INFEASIBLE: status={solver_obj.StatusName(status)}")
@@ -866,6 +1251,14 @@ def optimize():
             print(f"=== REBALANCE COMPLETE ===\n")
         # ─── END REBALANCE ───────────────────────────────────────
 
+        # Compute updated global exposure counts for the caller
+        updated_exposure = dict(global_exposure_actual)
+        for lu in all_lineups:
+            for p in lu.get('players', []):
+                pid = str(p.get('slatePlayerId', ''))
+                if pid:
+                    updated_exposure[pid] = updated_exposure.get(pid, 0) + 1
+
         if not all_lineups:
             return jsonify({
                 'success': False,
@@ -924,7 +1317,8 @@ def optimize():
         return jsonify({
             'success': True,
             'lineups': all_lineups,
-            'generated': len(all_lineups)
+            'generated': len(all_lineups),
+            'updatedExposure': updated_exposure,
         })
 
     except Exception as e:
@@ -934,4 +1328,6 @@ def optimize():
         return jsonify({'success': False, 'error': str(e)})
 
 if __name__ == '__main__':
-    app.run(port=5001, debug=True)
+    port = int(os.environ.get('PORT', 5001))
+    debug = os.environ.get('FLASK_ENV', 'production') != 'production'
+    app.run(host='0.0.0.0', port=port, debug=debug)

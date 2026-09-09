@@ -159,6 +159,7 @@ Respond with ONLY this JSON — no markdown, no explanation:
           'x-api-key': process.env.ANTHROPIC_API_KEY,
           'anthropic-version': '2023-06-01'
         },
+        signal: AbortSignal.timeout(30000),
         body: JSON.stringify({
           model: 'claude-sonnet-4-6',
           max_tokens: 8000,

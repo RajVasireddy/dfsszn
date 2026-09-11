@@ -15,6 +15,18 @@ export default function Optimizer() {
     const [optimizerStatus, setOptimizerStatus] = useState('unknown')
     const [posFilter, setPosFilter] = useState('ALL')
     const [search, setSearch] = useState('')
+    const [showAddPlayer, setShowAddPlayer] = useState(false)
+    const [customPlayers, setCustomPlayers] = useState([])
+    const [newPlayer, setNewPlayer] = useState({
+        name: '',
+        position: '',
+        team: '',
+        salary: '',
+        projection: '',
+        ownership: '',
+        opponent: '',
+    })
+    const [addPlayerError, setAddPlayerError] = useState('')
     // Separate from posFilter/search above — those drive the main player table;
     // the Stack Builder panel has its own tabs/search box and was wrongly wired
     // to share that state (so its tabs both did nothing to its own list AND
@@ -145,6 +157,19 @@ export default function Optimizer() {
     // player (see parseShowdownCSV), so every row is CPT-eligible already —
     // a CPT filter would just be a second copy of ALL.
     const positionTabs = isShowdown ? ['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'DST'] : (POSITIONS[sport] || [])
+
+    // Selectable positions for the "Add Custom Player" form — NBA/other
+    // sports fall through to the NFL list below since this app doesn't
+    // otherwise support manually adding players for them yet.
+    const getPositionOptions = () => {
+        if (sport === 'nfl') {
+            return ['QB', 'RB', 'WR', 'TE', 'K', 'DST']
+        }
+        if (sport === 'mlb') {
+            return ['SP', 'RP', 'C', '1B', '2B', '3B', 'SS', 'OF']
+        }
+        return ['QB', 'RB', 'WR', 'TE', 'K', 'DST']
+    }
 
     // Optional constraints a user can toggle on for a showdown slate — each
     // maps to a constraint the optimizer applies across every lineup it builds.
@@ -460,6 +485,9 @@ export default function Optimizer() {
         setCustomOwnership({})
         setImportedProjections({})
         setImportStatus(null)
+        // Custom players are sport-specific (position/roster-slot schema
+        // differs per sport), same reasoning as the resets above.
+        setCustomPlayers([])
         setGameFilter(null)
         setPosFilter('ALL')
         setStackBuilderPosFilter('ALL')
@@ -3039,6 +3067,8 @@ export default function Optimizer() {
                 importedProjections,
                 // Slate notes
                 slateNotes,
+                // Custom players
+                customPlayers,
             }
             const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' })
             const url = URL.createObjectURL(blob)
@@ -3107,6 +3137,18 @@ export default function Optimizer() {
                     console.log(`Restored manual slate: ${settings.manualPlayers.length} players`)
                 }
 
+                // Restore custom players — appended after the manual-slate
+                // restore above (which replaces `players` wholesale), so
+                // these don't get wiped out by that assignment.
+                if (settings.customPlayers?.length > 0) {
+                    setCustomPlayers(settings.customPlayers)
+                    setPlayers(prev => {
+                        const existingIds = new Set(prev.map(p => p.SlatePlayerID))
+                        const newCustom = settings.customPlayers.filter(p => !existingIds.has(p.SlatePlayerID))
+                        return [...prev, ...newCustom]
+                    })
+                }
+
                 console.log('Slate settings imported from file')
                 setSettingsSaveSuccess(true)
                 setTimeout(() => setSettingsSaveSuccess(false), 2000)
@@ -3119,6 +3161,97 @@ export default function Optimizer() {
         reader.readAsText(file)
     }
     // ─── End slate settings persistence ──────────────────────────────────────
+
+    // ─── Add Custom Player ────────────────────────────────────────────────────
+    const addCustomPlayer = () => {
+        setAddPlayerError('')
+
+        // Validate required fields
+        if (!newPlayer.name.trim()) {
+            setAddPlayerError('Player name is required')
+            return
+        }
+        if (!newPlayer.position) {
+            setAddPlayerError('Position is required')
+            return
+        }
+        if (!newPlayer.team.trim()) {
+            setAddPlayerError('Team is required')
+            return
+        }
+        const salary = parseInt(newPlayer.salary)
+        if (!salary || salary < 1000) {
+            setAddPlayerError('Valid salary required (min $1,000)')
+            return
+        }
+
+        // Check for duplicate
+        const duplicate = players.find(p =>
+            p.OperatorPlayerName?.toLowerCase() === newPlayer.name.trim().toLowerCase() &&
+            p.Team?.toUpperCase() === newPlayer.team.trim().toUpperCase()
+        )
+        if (duplicate) {
+            setAddPlayerError('Player already exists in pool')
+            return
+        }
+
+        // Build player object matching existing schema
+        const customId = 80000 + customPlayers.length + Date.now() % 10000
+
+        // Get roster slots based on sport and position
+        const getRosterSlots = (pos) => {
+            if (sport === 'nfl') {
+                if (pos === 'QB') return ['QB']
+                if (pos === 'RB') return ['RB', 'FLEX']
+                if (pos === 'WR') return ['WR', 'FLEX']
+                if (pos === 'TE') return ['TE', 'FLEX']
+                if (pos === 'K') return ['K']
+                if (pos === 'DST') return ['DST', 'DEF']
+                return [pos]
+            }
+            if (pos === 'SP' || pos === 'RP') return ['P']
+            return [pos]
+        }
+
+        const player = {
+            SlatePlayerID: customId,
+            SlateGameID: players[0]?.SlateGameID || 'custom-game',
+            PlayerID: customId,
+            OperatorPlayerName: newPlayer.name.trim(),
+            OperatorPosition: newPlayer.position.toUpperCase(),
+            OperatorSalary: salary,
+            OperatorRosterSlots: getRosterSlots(newPlayer.position),
+            Team: newPlayer.team.trim().toUpperCase(),
+            Opponent: newPlayer.opponent.trim().toUpperCase() || '',
+            ProjectedPoints: parseFloat(newPlayer.projection) || 0,
+            OwnershipProjection: parseFloat(newPlayer.ownership) || 0,
+            IsCustomPlayer: true,
+            RemovedByOperator: false,
+            PlayerGameProjectionStatID: 1,
+        }
+
+        setCustomPlayers(prev => [...prev, player])
+        setPlayers(prev => [...prev, player])
+
+        // Reset form but keep team/opponent for quick adding
+        setNewPlayer(prev => ({
+            name: '',
+            position: prev.position,
+            team: prev.team,
+            salary: '',
+            projection: '',
+            ownership: '',
+            opponent: prev.opponent,
+        }))
+
+        setAddPlayerError('')
+    }
+
+    const removeCustomPlayer = (playerId) => {
+        setCustomPlayers(prev => prev.filter(p => p.SlatePlayerID !== playerId))
+        setPlayers(prev => prev.filter(p => p.SlatePlayerID !== playerId))
+    }
+    // ─── End Add Custom Player ────────────────────────────────────────────────
 
     return (
         <div className="min-h-screen" style={{ background: '#0A1628' }}>
@@ -4716,7 +4849,247 @@ export default function Optimizer() {
                                 </button>
                             </div>
                         )}
+                        <button
+                            onClick={() => setShowAddPlayer(!showAddPlayer)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                            style={{
+                                background: showAddPlayer || customPlayers.length > 0
+                                    ? 'rgba(34,197,94,0.08)' : '#132244',
+                                borderColor: showAddPlayer || customPlayers.length > 0
+                                    ? '#22C55E' : '#223366',
+                                color: showAddPlayer || customPlayers.length > 0
+                                    ? '#22C55E' : '#8A9BBE'
+                            }}>
+                            + Add Player
+                            {customPlayers.length > 0 && (
+                                <span className="px-1.5 py-0.5 rounded-full text-xs font-black ml-1"
+                                    style={{ background: '#22C55E', color: '#0A1628' }}>
+                                    {customPlayers.length}
+                                </span>
+                            )}
+                        </button>
                     </div>
+
+                    {showAddPlayer && (
+                        <div className="mb-3 p-4 rounded-xl border border-[#22C55E] overflow-hidden"
+                            style={{ background: 'rgba(34,197,94,0.04)' }}>
+
+                            <div className="flex items-center justify-between mb-3">
+                                <div className="text-xs font-bold text-[#22C55E]">
+                                    ➕ Add Custom Player
+                                </div>
+                                <button
+                                    onClick={() => {
+                                        setShowAddPlayer(false)
+                                        setAddPlayerError('')
+                                        setNewPlayer({
+                                            name: '', position: '', team: '',
+                                            salary: '', projection: '',
+                                            ownership: '', opponent: ''
+                                        })
+                                    }}
+                                    className="text-[#8A9BBE] hover:text-white text-sm transition-colors">
+                                    ✕
+                                </button>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2 mb-2">
+
+                                {/* Player Name */}
+                                <div className="col-span-2">
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Player Name *
+                                    </div>
+                                    <input
+                                        type="text"
+                                        value={newPlayer.name}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev, name: e.target.value
+                                        }))}
+                                        onKeyDown={e => {
+                                            if (e.key === 'Enter') addCustomPlayer()
+                                        }}
+                                        placeholder="e.g. Patrick Mahomes"
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border focus:border-[#22C55E] text-white"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}
+                                        autoFocus
+                                    />
+                                </div>
+
+                                {/* Position */}
+                                <div>
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Position *
+                                    </div>
+                                    <select
+                                        value={newPlayer.position}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev, position: e.target.value
+                                        }))}
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border text-white"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}>
+                                        <option value="">Select...</option>
+                                        {getPositionOptions().map(pos => (
+                                            <option key={pos} value={pos}>{pos}</option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {/* Team */}
+                                <div>
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Team *
+                                    </div>
+                                    <input
+                                        type="text"
+                                        value={newPlayer.team}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev,
+                                            team: e.target.value.toUpperCase()
+                                        }))}
+                                        placeholder="e.g. KC"
+                                        maxLength={5}
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border focus:border-[#22C55E] text-white uppercase"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}
+                                    />
+                                </div>
+
+                                {/* Salary */}
+                                <div>
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Salary *
+                                    </div>
+                                    <input
+                                        type="number"
+                                        value={newPlayer.salary}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev, salary: e.target.value
+                                        }))}
+                                        placeholder="e.g. 8400"
+                                        min="1000"
+                                        max="15000"
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border focus:border-[#22C55E] text-white"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}
+                                    />
+                                </div>
+
+                                {/* Opponent */}
+                                <div>
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Opponent
+                                    </div>
+                                    <input
+                                        type="text"
+                                        value={newPlayer.opponent}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev,
+                                            opponent: e.target.value.toUpperCase()
+                                        }))}
+                                        placeholder="e.g. LV"
+                                        maxLength={5}
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border focus:border-[#22C55E] text-white uppercase"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}
+                                    />
+                                </div>
+
+                                {/* Projection */}
+                                <div>
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Proj Pts
+                                    </div>
+                                    <input
+                                        type="number"
+                                        value={newPlayer.projection}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev, projection: e.target.value
+                                        }))}
+                                        placeholder="e.g. 24.5"
+                                        step="0.1"
+                                        min="0"
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border focus:border-[#22C55E] text-white"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}
+                                    />
+                                </div>
+
+                                {/* Ownership */}
+                                <div>
+                                    <div className="text-xs text-[#8A9BBE] mb-1">
+                                        Own %
+                                    </div>
+                                    <input
+                                        type="number"
+                                        value={newPlayer.ownership}
+                                        onChange={e => setNewPlayer(prev => ({
+                                            ...prev, ownership: e.target.value
+                                        }))}
+                                        placeholder="e.g. 18.5"
+                                        step="0.5"
+                                        min="0"
+                                        max="100"
+                                        className="w-full px-3 py-2 rounded-lg text-sm outline-none border focus:border-[#22C55E] text-white"
+                                        style={{ background: '#0A1628', borderColor: '#223366' }}
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Error */}
+                            {addPlayerError && (
+                                <div className="text-xs text-[#EF4444] mb-2">
+                                    ⚠ {addPlayerError}
+                                </div>
+                            )}
+
+                            {/* Add button */}
+                            <button
+                                onClick={addCustomPlayer}
+                                className="w-full py-2 rounded-lg text-sm font-bold transition-all"
+                                style={{
+                                    background: 'linear-gradient(135deg, #22C55E, #16A34A)',
+                                    color: '#ffffff'
+                                }}>
+                                + Add to Player Pool
+                            </button>
+
+                            {/* Custom players list */}
+                            {customPlayers.length > 0 && (
+                                <div className="mt-3 pt-3 border-t border-[#223366]">
+                                    <div className="text-xs font-bold text-[#22C55E] mb-2">
+                                        {customPlayers.length} custom player{customPlayers.length > 1 ? 's' : ''} added:
+                                    </div>
+                                    <div className="space-y-1">
+                                        {customPlayers.map(p => (
+                                            <div key={p.SlatePlayerID}
+                                                className="flex items-center justify-between py-1">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-xs px-1.5 py-0.5 rounded font-bold"
+                                                        style={{
+                                                            background: 'rgba(34,197,94,0.15)',
+                                                            color: '#22C55E'
+                                                        }}>
+                                                        {p.OperatorPosition}
+                                                    </span>
+                                                    <span className="text-xs text-white">
+                                                        {p.OperatorPlayerName}
+                                                    </span>
+                                                    <span className="text-xs text-[#8A9BBE]">
+                                                        {p.Team}
+                                                    </span>
+                                                    <span className="text-xs font-mono text-white">
+                                                        ${p.OperatorSalary?.toLocaleString()}
+                                                    </span>
+                                                </div>
+                                                <button
+                                                    onClick={() => removeCustomPlayer(p.SlatePlayerID)}
+                                                    className="text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors">
+                                                    ✕
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
 
                     {/* Player Table */}
                     <div className="rounded-xl border border-[#223366] overflow-hidden"
@@ -4898,6 +5271,17 @@ export default function Optimizer() {
                                                             <div>
                                                                 <div className="flex items-center gap-1">
                                                                     <span className="text-xs font-semibold text-white">{player.OperatorPlayerName}</span>
+                                                                    {player.IsCustomPlayer && (
+                                                                        <span className="text-xs px-1 py-0 rounded ml-1"
+                                                                            style={{
+                                                                                background: 'rgba(34,197,94,0.15)',
+                                                                                color: '#22C55E',
+                                                                                fontSize: '9px',
+                                                                                fontWeight: 'bold'
+                                                                            }}>
+                                                                            CUSTOM
+                                                                        </span>
+                                                                    )}
                                                                     {(player.OwnershipProjection < 10 && player.ProjectedPoints > 15) && (
                                                                         <span className="text-xs font-bold px-1 py-0 rounded"
                                                                             style={{ background: 'rgba(255,184,0,0.15)', color: '#FFB800' }}>

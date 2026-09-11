@@ -5,6 +5,8 @@ import { useState, useEffect } from 'react'
 export default function Optimizer() {
     const [sport, setSport] = useState('mlb')
     const [platform, setPlatform] = useState('draftkings')
+    const [slateType, setSlateType] = useState('classic') // 'classic' or 'showdown' — NFL DK only
+    const [showdownRules, setShowdownRules] = useState([]) // array of active SHOWDOWN_RULES ids
     const [slates, setSlates] = useState([])
     const [selectedSlate, setSelectedSlate] = useState(null)
     const [players, setPlayers] = useState([])
@@ -27,6 +29,9 @@ export default function Optimizer() {
     const [showLineupCount, setShowLineupCount] = useState(false)
     const [saving, setSaving] = useState(false)
     const [saveSuccess, setSaveSuccess] = useState(false)
+    // Distinct from saveSuccess above (that one flags "lineups saved to My
+    // Lineups") — this flags "slate settings imported from a file".
+    const [settingsSaveSuccess, setSettingsSaveSuccess] = useState(false)
     const [gameFilter, setGameFilter] = useState(null)
     const [stackTeam, setStackTeam] = useState(null)
     const [fillPool, setFillPool] = useState([])
@@ -55,6 +60,7 @@ export default function Optimizer() {
     const [likedPlayers, setLikedPlayers] = useState([])
     const [customProjections, setCustomProjections] = useState({})
     const [customOwnership, setCustomOwnership] = useState({})
+    const [customCptOwnership, setCustomCptOwnership] = useState({}) // showdown only — ownership % when captained
     const [importedProjections, setImportedProjections] = useState({})
     const [importStatus, setImportStatus] = useState(null)
     const [showImport, setShowImport] = useState(false)
@@ -131,8 +137,88 @@ export default function Optimizer() {
         },
     }
 
+    const isShowdown = sport === 'nfl' && slateType === 'showdown' && platform === 'draftkings'
     const cap = SALARY_CAP[sport][platform]
-    const slots = LINEUP_SLOTS[sport][platform]
+    const slots = isShowdown ? ['CPT', 'FLEX', 'FLEX', 'FLEX', 'FLEX', 'FLEX'] : LINEUP_SLOTS[sport][platform]
+    // Showdown pools mix every skill position — POSITIONS[sport] alone
+    // doesn't cover that. No separate CPT tab: the pool is one row per
+    // player (see parseShowdownCSV), so every row is CPT-eligible already —
+    // a CPT filter would just be a second copy of ALL.
+    const positionTabs = isShowdown ? ['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'DST'] : (POSITIONS[sport] || [])
+
+    // Optional constraints a user can toggle on for a showdown slate — each
+    // maps to a constraint the optimizer applies across every lineup it builds.
+    const SHOWDOWN_RULES = [
+        {
+            id: 'cpt_skill_only',
+            label: 'Skill Player at CPT',
+            description: 'Captain must be QB, RB, WR, or TE',
+            category: 'captain'
+        },
+        {
+            id: 'cpt_low_own',
+            label: 'CPT Under 20% Ownership',
+            description: 'Captain must have projected ownership below 20%',
+            category: 'captain'
+        },
+        {
+            id: 'flex_one_low_own',
+            label: 'At Least 1 FLEX Under 20% Own',
+            description: 'At least one FLEX player under 20% ownership',
+            category: 'flex'
+        },
+        {
+            id: 'flex_min_own',
+            label: 'All FLEX At Least 5% Owned',
+            description: 'No FLEX player under 5% projected ownership',
+            category: 'flex'
+        },
+        {
+            id: 'must_have_qb_or_dst',
+            label: 'Must Have QB or DST',
+            description: 'Lineup must include at least one QB or DST',
+            category: 'construction'
+        },
+        {
+            id: 'stack_same_team',
+            label: 'Min 3 Players Same Team',
+            description: 'At least 3 players from the same team',
+            category: 'construction'
+        },
+        {
+            id: 'both_teams',
+            label: 'Players From Both Teams',
+            description: 'Must have at least 1 player from each team',
+            category: 'construction'
+        },
+        {
+            id: 'no_dst_cpt',
+            label: 'No DST as Captain',
+            description: 'DST cannot be placed in the CPT slot',
+            category: 'captain'
+        },
+        {
+            id: 'cpt_high_proj',
+            label: 'CPT Highest Projected',
+            description: 'Captain must be among top 5 projected players',
+            category: 'captain'
+        },
+        {
+            id: 'no_kicker_cpt',
+            label: 'No Kicker as Captain',
+            description: 'Kicker cannot be placed in the CPT slot',
+            category: 'captain'
+        },
+    ]
+
+    const toggleShowdownRule = (ruleId) => {
+        setShowdownRules(prev =>
+            prev.includes(ruleId)
+                ? prev.filter(r => r !== ruleId)
+                : [...prev, ruleId]
+        )
+    }
+
     const lineup = lineups[activeLineup] || new Array(slots.length).fill(null)
     const setLineup = (newLineup) => {
         const updated = [...lineups]
@@ -162,6 +248,16 @@ export default function Optimizer() {
         if (custom !== undefined && custom !== '') return parseFloat(custom) || 0
         return getOwnership(player)
     }
+    // Showdown only: a player's ownership when rostered as CPT is usually
+    // much lower than their FLEX ownership (fewer people pay the 1.5x salary
+    // to captain them) — there's no reliable way to derive it from FLEX
+    // ownership, so this only ever reflects what the user explicitly typed in.
+    const getCptOwnership = (player) => {
+        if (!player) return 0
+        const custom = customCptOwnership[player.SlatePlayerID]
+        if (custom !== undefined && custom !== '') return parseFloat(custom) || 0
+        return 0
+    }
     const getPlayerExposure = (player) => {
         const validLineups = lineups.filter(l => l && l.some(p => p !== null))
         if (validLineups.length === 0) return null
@@ -169,6 +265,16 @@ export default function Optimizer() {
             lu.some(p => p?.SlatePlayerID === player.SlatePlayerID)
         ).length
         return { count, total: validLineups.length, pct: Math.round((count / validLineups.length) * 100) }
+    }
+    // Showdown only: what fraction of generated lineups used this player
+    // specifically as CAPTAIN (as opposed to just being in the lineup at all).
+    const getPlayerCptExposure = (player) => {
+        const validLineups = lineups.filter(l => l && l.some(p => p !== null))
+        if (validLineups.length === 0) return null
+        const count = validLineups.filter(lu =>
+            lu.some(p => p?.SlatePlayerID === player.SlatePlayerID && p?.IsCaptain === true)
+        ).length
+        return count > 0 ? { count, total: validLineups.length, pct: Math.round((count / validLineups.length) * 100) } : null
     }
 
     const getValueScore = (player) => {
@@ -222,8 +328,12 @@ export default function Optimizer() {
         }
     }, [sport, platform, selectedDate, slateSource])
 
-    // Sync salary range defaults when sport/platform changes, but not on first mount
-    // (so restored session state isn't clobbered back to defaults)
+    // Sync salary range defaults when sport/platform/slateType changes, but
+    // not on first mount (so restored session state isn't clobbered back to
+    // defaults). Showdown's 50000 cap works out to the same 49500-50000 range
+    // as classic NFL DraftKings already produces below — slateType is only in
+    // the dependency array so toggling into Showdown re-applies that default
+    // even if the user had customized min/max while in classic mode.
     useEffect(() => {
         if (isFirstMount) return
         let min = '49500', max = '50000'
@@ -236,7 +346,7 @@ export default function Optimizer() {
         setTeamSalaryMax(max)
         setSalaryMin(min)
         setSalaryMax(max)
-    }, [sport, platform])
+    }, [sport, platform, slateType])
 
     // Sync players from manualPlayers when slate source is manual
     useEffect(() => {
@@ -325,6 +435,8 @@ export default function Optimizer() {
     const handleSportChange = (newSport) => {
         if (newSport === sport) return
         setSport(newSport)
+        setSlateType('classic')
+        setShowdownRules([])
         setPlayers([])
         setManualPlayers([])
         setManualSlateInfo(null)
@@ -1116,13 +1228,19 @@ export default function Optimizer() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    players: eligiblePool.map(p => ({
+                    // Showdown: expand the single-row-per-player pool into its
+                    // FLEX/CPT pair here, at request-build time — see
+                    // expandShowdownPool for why that duplication doesn't live
+                    // in the displayed pool itself.
+                    players: (isShowdown ? expandShowdownPool(eligiblePool) : eligiblePool).map(p => ({
                         slatePlayerId: p.SlatePlayerID,
                         slateGameId: p.SlateGameID,
                         operatorPlayerName: p.OperatorPlayerName,
                         operatorPosition: p.OperatorPosition,
                         operatorSalary: p.OperatorSalary,
                         operatorRosterSlots: p.OperatorRosterSlots,
+                        isCaptain: p.IsCaptain || false,
+                        captainBaseId: p.CaptainBaseId || null,
                         team: p.Team,
                         opponent: getOpponent(p),
                         opp: getOpponent(p),
@@ -1138,6 +1256,9 @@ export default function Optimizer() {
                     ),
                     slots,
                     cap,
+                    slateType,
+                    isShowdown,
+                    showdownRules: slateType === 'showdown' ? showdownRules : [],
                     minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                     maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                     numLineups: lineupCount,
@@ -1197,14 +1318,30 @@ export default function Optimizer() {
 
             const data = await res.json()
 
+            if (isShowdown && data.lineups?.length > 0) {
+                console.log('Showdown lineup from Python:', JSON.stringify(data.lineups[0], null, 2))
+                console.log('EligiblePool sample:', eligiblePool.slice(0, 3).map(p => ({
+                    id: p.SlatePlayerID,
+                    name: p.OperatorPlayerName,
+                    team: p.Team
+                })))
+            }
+
             if (!data.success) {
                 setGenerationError(data.error || 'Failed to generate lineups.')
                 setLoading(false)
                 return
             }
 
-            // Assign players to slots correctly
-            const properLineups = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
+            // Assign players to slots correctly. Showdown responses carry the
+            // synthetic +100000 CPT ids, so look them up against the same
+            // expanded pool the request was built from (plain eligiblePool
+            // has no row at that id and the captain slot would come back empty).
+            const properLineups = data.lineups.map(lu => mapLineupPlayersToSlots(
+                lu.players,
+                isShowdown ? expandShowdownPool(eligiblePool) : eligiblePool,
+                slots
+            ))
 
             const paddedLineups = Array.from(
                 { length: lineupCount },
@@ -1556,6 +1693,174 @@ export default function Optimizer() {
         }
     }
 
+    // DraftKings Showdown: every player can fill either the CPT slot (1.5x
+    // salary and points) or a FLEX slot — but that's a fact about how the
+    // OPTIMIZER should treat each player, not about how many rows they get
+    // in the displayed pool. This parser produces exactly ONE row per real
+    // person, at their normal FLEX salary/points, tagged eligible for both
+    // slots via OperatorRosterSlots. The CPT (1.5x) duplicate the optimizer's
+    // captain-exclusivity constraint needs is built later, at request-build
+    // time, by expandShowdownPool (below) — never stored in pool/players state.
+    const parseShowdownCSV = (csvText) => {
+        const lines = csvText.trim().split('\n')
+        const headers = lines[0].split(',')
+            .map(h => h.trim().toLowerCase()
+                .replace(/\s+/g, '_')
+                .replace(/[^a-z_]/g, ''))
+
+        const idx = (name) => {
+            const names = Array.isArray(name) ? name : [name]
+            for (const n of names) {
+                const i = headers.indexOf(n)
+                if (i !== -1) return i
+            }
+            return -1
+        }
+
+        const parsedPlayers = []
+
+        lines.slice(1).forEach((line, i) => {
+            if (!line.trim()) return
+            const cols = line.split(',')
+
+            // Support both DK export format and DFF format
+            let name, position, team, salary, proj, own
+
+            // DK export format: Name, Position, Salary, TeamAbbrev, AvgPointsPerGame
+            if (idx('name') !== -1) {
+                name = (cols[idx('name')] || '').trim()
+                // DK's own showdown export sometimes lists the captain slot as
+                // a separate "Name (CPT)" row — skip it, since we build the
+                // CPT version ourselves (from the base row) at request time.
+                if (name.includes('(CPT)') || name.includes(' CPT')) return
+                position = (cols[idx('position')] || '').trim().toUpperCase()
+                team = (cols[idx(['teamabbrev', 'team'])] || '').trim().toUpperCase()
+                salary = parseInt((cols[idx('salary')] || '0').replace(/[$,]/g, '')) || 0
+                proj = parseFloat(
+                    cols[idx([
+                        'avgpointspergame',
+                        'ppg_projection',
+                        'projection',
+                        'avg_points_per_game'
+                    ])] || 0
+                )
+                own = parseFloat(
+                    cols[idx(['ownership', 'ownership_projection', 'own_pct'])] || 0
+                )
+            } else {
+                // DFF format
+                const firstName = (cols[idx('first_name')] || '').trim()
+                const lastName = (cols[idx('last_name')] || '').trim()
+                name = `${firstName} ${lastName}`.trim()
+                position = (cols[idx('position')] || '').trim().toUpperCase()
+                team = (cols[idx('team')] || '').trim().toUpperCase()
+                salary = parseInt(cols[idx('salary')]) || 0
+                proj = parseFloat(cols[idx('ppg_projection')] || 0)
+                own = parseFloat(cols[idx('ownership_projection')] || 0)
+            }
+
+            if (!name || !salary) return
+
+            // Normalize position for showdown — DST/DEF entries often use the
+            // team name as the player name instead of a person's name
+            if (position === 'DST' || position === 'DEF' || position === 'D/ST') {
+                position = 'DST'
+                if (!name.includes('D/ST') && !name.includes('DST')) {
+                    name = `${team} D/ST`
+                }
+            } else if (position === 'K' || position === 'PK') {
+                // Some cheat-sheet sources (DFF in particular) label the
+                // kicker position "PK" instead of DK's "K" — normalize so the
+                // K filter tab and slot-eligibility checks actually catch them.
+                position = 'K'
+            } else if (!position) {
+                // Skip rows with no position at all — blank/malformed CSV
+                // lines, not real players.
+                return
+            }
+
+            // ONE row per player, at their normal FLEX salary/points. The
+            // dedicated CPT badge in the lineup UI signals captain status
+            // once the optimizer actually assigns someone to that slot —
+            // there's no separate "(CPT)"-named or 1.5x-priced pool row.
+            parsedPlayers.push({
+                SlatePlayerID: 90000 + i,
+                SlateGameID: 'showdown-game-1',
+                OperatorPlayerName: name,
+                OperatorPosition: position,
+                OperatorSalary: salary,
+                OperatorRosterSlots: ['FLEX', 'CPT'],
+                Team: team,
+                ProjectedPoints: proj,
+                OwnershipProjection: own,
+                IsShowdown: true,
+                IsCaptain: false,
+            })
+        })
+
+        // Build slate info
+        const teams = [...new Set(parsedPlayers.map(p => p.Team).filter(Boolean))]
+
+        console.log(`Showdown parsed: ${parsedPlayers.length} players, teams: ${teams.join(', ')}`)
+
+        const posCounts = {}
+        parsedPlayers.forEach(p => {
+            posCounts[p.OperatorPosition] = (posCounts[p.OperatorPosition] || 0) + 1
+        })
+        console.log('Showdown positions:', posCounts)
+
+        const slateInfo = {
+            SlateID: 99998,
+            OperatorName: `Showdown${teams.length ? ' ' + teams.join(' vs ') : ''}`,
+            NumberOfGames: 1,
+            SalaryCap: cap,
+            SlateRosterSlots: slots,
+            DfsSlateGames: [{
+                SlateGameID: 'showdown-game-1',
+                Game: {
+                    AwayTeam: teams[0] || '',
+                    HomeTeam: teams[1] || '',
+                    OverUnder: null,
+                    PointSpread: null,
+                }
+            }],
+            players: parsedPlayers,
+            IsShowdown: true,
+        }
+
+        return { players: parsedPlayers, slateInfo }
+    }
+
+    // At request-build time only — never in the displayed pool above — expand
+    // each showdown player into their FLEX (base salary) and CPT (1.5x salary
+    // and points, id = baseId + 100000) rows. The optimizer's CPT/FLEX
+    // exclusivity constraint needs two distinct entries per real person to
+    // choose between; showing that duplication in the player table is exactly
+    // the bug this pass fixes, so it's built here instead.
+    const expandShowdownPool = (pool) => pool.flatMap(p => {
+        const proj = getProjection(p)
+        const flexOwn = getEffectiveOwnership(p)
+        return [
+            { ...p, OperatorRosterSlots: ['FLEX'], IsCaptain: false, ProjectedPoints: proj, OwnershipProjection: flexOwn },
+            {
+                ...p,
+                SlatePlayerID: p.SlatePlayerID + 100000,
+                OperatorSalary: Math.round((p.OperatorSalary || 0) * 1.5),
+                OperatorRosterSlots: ['CPT'],
+                IsCaptain: true,
+                CaptainBaseId: p.SlatePlayerID,
+                ProjectedPoints: Math.round(proj * 1.5 * 100) / 100,
+                BaseProjectedPoints: proj,
+                // CPT ownership is a distinct number from FLEX ownership (far
+                // fewer people pay 1.5x salary to captain someone) — use the
+                // user-entered CPT Own% if set, else fall back to FLEX
+                // ownership rather than sending 0 (which would make every
+                // captain look "contrarian" to the optimizer's leverage math).
+                OwnershipProjection: getCptOwnership(p) || flexOwn,
+            },
+        ]
+    })
+
     const handleManualSlateUpload = (e) => {
         const file = e.target.files[0]
         if (!file) return
@@ -1563,6 +1868,38 @@ export default function Optimizer() {
         const reader = new FileReader()
         reader.onload = (event) => {
             const csvText = event.target.result
+
+            // Use showdown parser if in showdown mode
+            if (isShowdown) {
+                const { players: parsed, slateInfo } = parseShowdownCSV(csvText)
+
+                // Safety dedup by SlatePlayerID — parseShowdownCSV already
+                // emits one row per player, but this guards against a stale/
+                // malformed CSV (or a future parser change) slipping a repeat
+                // row past it, which would otherwise show every duplicated
+                // player twice in the pool.
+                const deduped = parsed.filter((p, idx, arr) =>
+                    arr.findIndex(x => x.SlatePlayerID === p.SlatePlayerID) === idx
+                )
+                console.log(`After dedup: ${deduped.length} players`)
+
+                setManualPlayers(deduped)
+                setManualSlateInfo(slateInfo)
+                setSlateSource('manual')
+                setSelectedSlate(slateInfo)
+                setPlayers(deduped)
+                setError(null)
+                setLoading(false)
+                setLineups([new Array(slots.length).fill(null)])
+                setActiveLineup(0)
+                setShowSlateUpload(false)
+                setImportedProjections({})
+                setCustomProjections({})
+                setImportStatus(null)
+                return  // CRITICAL: never fall through to classic parsing below
+            }
+
+            // Existing classic parsing below
             const { players: parsed, slateInfo } = parseManualSlateCSV(csvText)
 
             setManualPlayers(parsed)
@@ -1714,13 +2051,19 @@ export default function Optimizer() {
 
         try {
             const requestBody = {
-                players: eligiblePool.map(p => ({
+                // Showdown: expand the single-row-per-player pool into its
+                // FLEX/CPT pair here, at request-build time — see
+                // expandShowdownPool for why that duplication doesn't live
+                // in the displayed pool itself.
+                players: (isShowdown ? expandShowdownPool(eligiblePool) : eligiblePool).map(p => ({
                     slatePlayerId: p.SlatePlayerID,
                     slateGameId: p.SlateGameID,
                     operatorPlayerName: p.OperatorPlayerName,
                     operatorPosition: p.OperatorPosition,
                     operatorSalary: p.OperatorSalary,
                     operatorRosterSlots: p.OperatorRosterSlots || [],
+                    isCaptain: p.IsCaptain || false,
+                    captainBaseId: p.CaptainBaseId || null,
                     team: p.Team,
                     opponent: getOpponent(p),
                     opp: getOpponent(p),
@@ -1737,6 +2080,9 @@ export default function Optimizer() {
                 ),
                 slots,
                 cap,
+                slateType,
+                isShowdown,
+                showdownRules: slateType === 'showdown' ? showdownRules : [],
                 minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                 maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                 numLineups: appendCount,
@@ -1773,8 +2119,14 @@ export default function Optimizer() {
                 return
             }
 
-            // Map returned players to full player objects
-            const newLineups = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
+            // Map returned players to full player objects. Showdown responses
+            // carry the synthetic +100000 CPT ids, so look them up against the
+            // same expanded pool the request was built from.
+            const newLineups = data.lineups.map(lu => mapLineupPlayersToSlots(
+                lu.players,
+                isShowdown ? expandShowdownPool(eligiblePool) : eligiblePool,
+                slots
+            ))
 
             // Append to existing valid lineups
             const existingValid = lineups.filter(l => l && l.some(p => p !== null))
@@ -2359,6 +2711,12 @@ export default function Optimizer() {
                 if (usedIds.has(p.slatePlayerId)) return false
                 const pos = p.operatorPosition || ''
                 const rs = p.operatorRosterSlots || []
+                // Showdown's CPT/FLEX slots are decided purely by which slot
+                // the optimizer assigned a player to (operatorRosterSlots),
+                // not by real-world position — a QB or DST can legally sit in
+                // a showdown FLEX slot, which the classic RB/WR/TE-only FLEX
+                // check below would otherwise reject.
+                if (isShowdown) return rs.includes(slot)
                 if (slot === 'P') return pos === 'SP' || pos === 'RP' || pos === 'P' || rs.includes('P')
                 if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos) || pos.split('/').some(part => ['RB', 'WR', 'TE'].includes(part))
                 if (pos.includes('/')) return pos.split('/').includes(slot)
@@ -2370,7 +2728,25 @@ export default function Optimizer() {
                 .sort((a, b) => (a.slatePlayerId ?? 0) - (b.slatePlayerId ?? 0))
             if (eligible.length > 0) {
                 const pick = eligible[0]
-                const fullPlayer = pool.find(ep => ep.SlatePlayerID === pick.slatePlayerId)
+                let fullPlayer = pool.find(ep => ep.SlatePlayerID === pick.slatePlayerId)
+                // Defensive fallback for showdown: `pool` is expected to be
+                // expandShowdownPool(eligiblePool), which does have a row at
+                // the synthetic CPT id (baseId + 100000) — but if a caller
+                // ever passes the raw, unexpanded pool instead, fall back to
+                // the real player's base id and then to name+team, rather
+                // than silently leaving the slot empty.
+                if (!fullPlayer && isShowdown) {
+                    const baseId = pick.captainBaseId ?? pick.slatePlayerId
+                    fullPlayer = pool.find(ep => ep.SlatePlayerID === baseId)
+                    if (!fullPlayer) {
+                        fullPlayer = pool.find(ep =>
+                            ep.OperatorPlayerName === pick.operatorPlayerName && ep.Team === pick.team
+                        )
+                    }
+                    if (!fullPlayer) {
+                        console.warn(`Showdown: could not find player "${pick.operatorPlayerName}" (id ${pick.slatePlayerId}) in pool`)
+                    }
+                }
                 if (fullPlayer) { newLineup[slotIndex] = fullPlayer; usedIds.add(pick.slatePlayerId) }
             }
         })
@@ -2409,13 +2785,19 @@ export default function Optimizer() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    players: eligiblePool.map(p => ({
+                    // Showdown: expand the single-row-per-player pool into its
+                    // FLEX/CPT pair here, at request-build time — see
+                    // expandShowdownPool for why that duplication doesn't live
+                    // in the displayed pool itself.
+                    players: (isShowdown ? expandShowdownPool(eligiblePool) : eligiblePool).map(p => ({
                         slatePlayerId: p.SlatePlayerID,
                         slateGameId: p.SlateGameID,
                         operatorPlayerName: p.OperatorPlayerName,
                         operatorPosition: p.OperatorPosition,
                         operatorSalary: p.OperatorSalary,
                         operatorRosterSlots: p.OperatorRosterSlots || [],
+                        isCaptain: p.IsCaptain || false,
+                        captainBaseId: p.CaptainBaseId || null,
                         team: p.Team,
                         opponent: getOpponent(p),
                         opp: getOpponent(p),
@@ -2425,6 +2807,9 @@ export default function Optimizer() {
                     })),
                     slots,
                     cap,
+                    slateType,
+                    isShowdown,
+                    showdownRules: slateType === 'showdown' ? showdownRules : [],
                     minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                     maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                     numLineups: stack.lineupCount,
@@ -2456,7 +2841,13 @@ export default function Optimizer() {
                 return
             }
 
-            const generatedLineups = data.lineups.map(lu => mapLineupPlayersToSlots(lu.players, eligiblePool, slots))
+            // Showdown responses carry the synthetic +100000 CPT ids, so look
+            // them up against the same expanded pool the request was built from.
+            const generatedLineups = data.lineups.map(lu => mapLineupPlayersToSlots(
+                lu.players,
+                isShowdown ? expandShowdownPool(eligiblePool) : eligiblePool,
+                slots
+            ))
 
             updateStack(stackId, { status: 'generated', generatedLineups, error: null })
 
@@ -2605,6 +2996,130 @@ export default function Optimizer() {
     }
     // ─── End Multi-Stack Builder helpers ─────────────────────────────────────
 
+    // ─── Slate settings persistence (file-based JSON) ────────────────────────
+    // File-based only — no localStorage. Distinct from saveStateToSession/
+    // restoreStateFromSession above, which still use sessionStorage purely to
+    // survive an accidental same-tab refresh mid-session (lineups included);
+    // this is the user-driven "save my rules to a file, load them back later
+    // or on another machine" path.
+    const exportSlateSettings = () => {
+        try {
+            const settings = {
+                version: 2,
+                exportedAt: new Date().toISOString(),
+                sport,
+                platform,
+                slateType,
+                selectedDate,
+                slateSource,
+                // Player customizations
+                customProjections,
+                customOwnership,
+                customCptOwnership,
+                // Pools and rules
+                pitcherPool,
+                commonPool,
+                fillPool,
+                multiStackRules,
+                stackExposures,
+                stackTeam,
+                legacyRules,
+                showdownRules,
+                // Game filters
+                teamSalaryMin,
+                teamSalaryMax,
+                playersPerTeamMax,
+                playersPerGameMax,
+                hittersVsPitcher,
+                uniquePlayersPerLineup,
+                // Manual slate
+                manualPlayers: slateSource === 'manual' ? manualPlayers : [],
+                manualSlateInfo: slateSource === 'manual' ? manualSlateInfo : null,
+                // Imported projections
+                importedProjections,
+                // Slate notes
+                slateNotes,
+            }
+            const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `dfsszn_${sport}_${slateType}_${selectedDate}.json`
+            a.click()
+            URL.revokeObjectURL(url)
+            console.log('Slate settings exported')
+        } catch (err) {
+            console.error('Failed to export settings:', err)
+        }
+    }
+
+    const importSlateSettings = (file) => {
+        if (!file) return
+        const reader = new FileReader()
+        reader.onload = (event) => {
+            try {
+                const settings = JSON.parse(event.target.result)
+
+                // Restore sport/platform/slate
+                if (settings.sport) setSport(settings.sport)
+                if (settings.platform) setPlatform(settings.platform)
+                if (settings.slateType) setSlateType(settings.slateType)
+                if (settings.selectedDate) setSelectedDate(settings.selectedDate)
+
+                // Restore player customizations
+                if (settings.customProjections) setCustomProjections(settings.customProjections)
+                if (settings.customOwnership) setCustomOwnership(settings.customOwnership)
+                if (settings.customCptOwnership) setCustomCptOwnership(settings.customCptOwnership)
+
+                // Restore pools
+                if (settings.pitcherPool) setPitcherPool(settings.pitcherPool)
+                if (settings.commonPool) setCommonPool(settings.commonPool)
+                if (settings.fillPool) setFillPool(settings.fillPool)
+                if (settings.multiStackRules) setMultiStackRules(settings.multiStackRules)
+
+                // Restore stack settings
+                if (settings.stackExposures) setStackExposures(settings.stackExposures)
+                if (settings.stackTeam) setStackTeam(settings.stackTeam)
+                if (settings.legacyRules) setLegacyRules(settings.legacyRules)
+                if (settings.showdownRules) setShowdownRules(settings.showdownRules)
+
+                // Restore game filter rules
+                if (settings.teamSalaryMin) setTeamSalaryMin(settings.teamSalaryMin)
+                if (settings.teamSalaryMax) setTeamSalaryMax(settings.teamSalaryMax)
+                if (settings.playersPerTeamMax) setPlayersPerTeamMax(settings.playersPerTeamMax)
+                if (settings.playersPerGameMax) setPlayersPerGameMax(settings.playersPerGameMax)
+                if (settings.hittersVsPitcher !== undefined) setHittersVsPitcher(settings.hittersVsPitcher)
+                if (settings.uniquePlayersPerLineup) setUniquePlayersPerLineup(settings.uniquePlayersPerLineup)
+
+                // Restore imported projections
+                if (settings.importedProjections) setImportedProjections(settings.importedProjections)
+
+                // Restore slate notes
+                if (settings.slateNotes) setSlateNotes(settings.slateNotes)
+
+                // Restore manual slate if it was active
+                if (settings.slateSource === 'manual' && settings.manualPlayers?.length > 0) {
+                    setSlateSource('manual')
+                    setManualPlayers(settings.manualPlayers)
+                    setManualSlateInfo(settings.manualSlateInfo)
+                    setSelectedSlate(settings.manualSlateInfo)
+                    setPlayers(settings.manualPlayers)
+                    console.log(`Restored manual slate: ${settings.manualPlayers.length} players`)
+                }
+
+                console.log('Slate settings imported from file')
+                setSettingsSaveSuccess(true)
+                setTimeout(() => setSettingsSaveSuccess(false), 2000)
+            } catch (err) {
+                console.error('Failed to import settings:', err)
+                setError('Invalid settings file')
+                setTimeout(() => setError(null), 3000)
+            }
+        }
+        reader.readAsText(file)
+    }
+    // ─── End slate settings persistence ──────────────────────────────────────
+
     return (
         <div className="min-h-screen" style={{ background: '#0A1628' }}>
 
@@ -2646,6 +3161,54 @@ export default function Optimizer() {
                         ))}
                     </div>
 
+                    {/* Classic/Showdown toggle — DK-only, so gated on platform too;
+                        otherwise clicking Showdown on FanDuel would flip slateType
+                        without isShowdown ever becoming true (it also checks
+                        platform), silently leaving classic slots active under a
+                        "Showdown" label. */}
+                    {sport === 'nfl' && platform === 'draftkings' && (
+                        <div className="flex rounded-lg overflow-hidden border border-[#223366]">
+                            <button
+                                onClick={() => {
+                                    setSlateType('classic')
+                                    setShowdownRules([])
+                                    setPlayers([])
+                                    setLineups([new Array(9).fill(null)])
+                                    setLineupCount(1)
+                                    setMultiStackRules([])
+                                    setPitcherPool([])
+                                    setCommonPool([])
+                                    setFillPool([])
+                                }}
+                                className="px-3 py-1.5 text-xs font-bold transition-all"
+                                style={{
+                                    background: slateType === 'classic' ? '#1A2E55' : 'transparent',
+                                    color: slateType === 'classic' ? '#FFB800' : '#8A9BBE'
+                                }}>
+                                Classic
+                            </button>
+                            <button
+                                onClick={() => {
+                                    setSlateType('showdown')
+                                    setPlayers([])
+                                    setLineups([new Array(6).fill(null)])
+                                    setLineupCount(1)
+                                    setMultiStackRules([])
+                                    setPitcherPool([])
+                                    setCommonPool([])
+                                    setFillPool([])
+                                    setShowSlateUpload(true)
+                                }}
+                                className="px-3 py-1.5 text-xs font-bold transition-all"
+                                style={{
+                                    background: slateType === 'showdown' ? '#1A2E55' : 'transparent',
+                                    color: slateType === 'showdown' ? '#FFB800' : '#8A9BBE'
+                                }}>
+                                Showdown
+                            </button>
+                        </div>
+                    )}
+
                     <div className="w-px h-6 bg-[#223366]" />
 
                     {/* Slate source toggle */}
@@ -2684,6 +3247,53 @@ export default function Optimizer() {
 
                     <div className="w-px h-6 bg-[#223366]" />
 
+                    {/* Slate settings — file-based export/import only */}
+                    <div className="flex items-center gap-2">
+
+                        {/* Export settings to JSON file */}
+                        <button
+                            onClick={exportSlateSettings}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                            style={{
+                                background: '#132244',
+                                borderColor: '#223366',
+                                color: '#8A9BBE'
+                            }}
+                            title="Export all settings to JSON file">
+                            ↓ Export
+                        </button>
+
+                        {/* Import settings from JSON file */}
+                        <label
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all cursor-pointer hover:border-[#FFB800] hover:text-[#FFB800]"
+                            style={{
+                                background: '#132244',
+                                borderColor: '#223366',
+                                color: '#8A9BBE'
+                            }}
+                            title="Import settings from JSON file">
+                            ↑ Import
+                            <input
+                                type="file"
+                                accept=".json"
+                                onChange={e => {
+                                    importSlateSettings(e.target.files[0])
+                                    e.target.value = ''
+                                }}
+                                className="hidden"
+                            />
+                        </label>
+
+                        {/* Success flash */}
+                        {settingsSaveSuccess && (
+                            <span className="text-xs text-[#22C55E] font-bold animate-pulse">
+                                ✓ Imported
+                            </span>
+                        )}
+                    </div>
+
+                    <div className="w-px h-6 bg-[#223366]" />
+
                     {/* Tool buttons */}
                     {[
                         {
@@ -2696,9 +3306,9 @@ export default function Optimizer() {
                         {
                             label: 'Filters',
                             icon: '⚙️',
-                            active: !!(multiStackRules.length || pitcherPool.length || commonPool.length || legacyRules.excludedPlayers.length),
+                            active: !!(multiStackRules.length || pitcherPool.length || commonPool.length || legacyRules.excludedPlayers.length || (slateType === 'showdown' && showdownRules.length)),
                             onClick: () => setShowGameFilters(true),
-                            badge: (multiStackRules.length + pitcherPool.length + commonPool.length + legacyRules.excludedPlayers.length) || null,
+                            badge: (multiStackRules.length + pitcherPool.length + commonPool.length + legacyRules.excludedPlayers.length + (slateType === 'showdown' ? showdownRules.length : 0)) || null,
                         },
                         {
                             label: 'Notes',
@@ -3319,7 +3929,7 @@ export default function Optimizer() {
                                                 <span className="text-xs text-[#8A9BBE]">{stackBuilderFilteredPlayers.length} players</span>
                                             )}
                                             <div className="ml-auto flex items-center gap-1">
-                                                {(POSITIONS[sport] || []).map(pos => (
+                                                {positionTabs.map(pos => (
                                                     <button key={pos} onClick={() => setStackBuilderPosFilter(pos)}
                                                         className="px-1.5 py-0.5 rounded text-xs font-bold transition-all"
                                                         style={{
@@ -4049,7 +4659,7 @@ export default function Optimizer() {
 
                     {/* Position Filters */}
                     <div className="flex gap-2 mb-4 flex-wrap items-center">
-                        {POSITIONS[sport].map(pos => (
+                        {positionTabs.map(pos => (
                             <button key={pos} onClick={() => setPosFilter(pos)}
                                 className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all"
                                 style={{
@@ -4147,6 +4757,11 @@ export default function Optimizer() {
                                                 <div className="text-xs text-[#818CF8] font-normal normal-case">Exp%</div>
                                             )}
                                         </th>
+                                        {slateType === 'showdown' && (
+                                            <th className="px-3 py-2 text-left text-xs font-semibold text-[#8A9BBE] uppercase tracking-wider">
+                                                CPT Own%
+                                            </th>
+                                        )}
                                         <th className="px-3 py-2 text-left text-xs font-semibold text-[#8A9BBE] uppercase tracking-wider">Value</th>
                                         <th className="px-3 py-2 text-left text-xs font-semibold text-[#8A9BBE] uppercase tracking-wider">Leverage</th>
                                         <th className="px-4 py-3 w-10"></th>
@@ -4385,8 +5000,45 @@ export default function Optimizer() {
                                                                     </div>
                                                                 )
                                                             })()}
+                                                            {slateType === 'showdown' && (() => {
+                                                                const cptExp = getPlayerCptExposure(player)
+                                                                if (!cptExp) return null
+                                                                return (
+                                                                    <div className="text-xs font-bold mt-0.5" style={{ color: '#FFB800' }}>
+                                                                        CPT: {cptExp.pct}%
+                                                                    </div>
+                                                                )
+                                                            })()}
                                                         </div>
                                                     </td>
+                                                    {slateType === 'showdown' && (
+                                                        <td className="px-3 py-1.5">
+                                                            <div className="flex items-center gap-1">
+                                                                <input
+                                                                    type="number"
+                                                                    min="0"
+                                                                    max="100"
+                                                                    value={customCptOwnership[player.SlatePlayerID] !== undefined
+                                                                        ? customCptOwnership[player.SlatePlayerID]
+                                                                        : ''}
+                                                                    onChange={e => setCustomCptOwnership(prev => ({
+                                                                        ...prev,
+                                                                        [player.SlatePlayerID]: e.target.value
+                                                                    }))}
+                                                                    placeholder="—"
+                                                                    className="w-12 px-1 py-0.5 rounded text-xs font-bold text-center outline-none border transition-colors"
+                                                                    style={{
+                                                                        background: customCptOwnership[player.SlatePlayerID] !== undefined
+                                                                            ? 'rgba(255,184,0,0.1)' : 'transparent',
+                                                                        borderColor: customCptOwnership[player.SlatePlayerID] !== undefined
+                                                                            ? '#FFB800' : 'rgba(34,51,102,0.5)',
+                                                                        color: '#FFB800'
+                                                                    }}
+                                                                />
+                                                                <span className="text-xs text-[#8A9BBE]">%</span>
+                                                            </div>
+                                                        </td>
+                                                    )}
                                                     <td className="px-3 py-1.5">
                                                         <span className="text-xs font-bold"
                                                             style={{ color: getValueColor(getValueScore(player)) }}>
@@ -4647,6 +5299,12 @@ export default function Optimizer() {
                                                                     🔗 {lineupStackTeam} ×{lineupStackCount}
                                                                 </div>
                                                             )}
+                                                            {lu.some(p => p === null) && (
+                                                                <div className="text-xs px-2 py-0.5 rounded font-bold"
+                                                                    style={{ background: 'rgba(239,68,68,0.1)', color: '#EF4444' }}>
+                                                                    ⚠ Incomplete
+                                                                </div>
+                                                            )}
                                                         </div>
                                                         <div>
                                                             <div className="text-xs text-[#8A9BBE]">Projected</div>
@@ -4703,7 +5361,23 @@ export default function Optimizer() {
                                                     <tbody>
                                                         {slots.map((slot, slotIndex) => {
                                                             const player = lu[slotIndex]
-                                                            if (!player) return null
+                                                            if (!player) return (
+                                                                <tr key={slotIndex}
+                                                                    style={{ borderBottom: '1px solid rgba(34,51,102,0.4)' }}>
+                                                                    <td className="px-3 py-1.5">
+                                                                        <span className="text-xs font-bold px-1.5 py-0.5 rounded"
+                                                                            style={{
+                                                                                background: slot === 'CPT' ? 'rgba(255,184,0,0.15)' : 'rgba(34,51,102,0.3)',
+                                                                                color: slot === 'CPT' ? '#FFB800' : '#556080'
+                                                                            }}>
+                                                                            {slot}
+                                                                        </span>
+                                                                    </td>
+                                                                    <td className="px-3 py-1.5 text-xs text-[#556080] italic" colSpan={5}>
+                                                                        Empty slot
+                                                                    </td>
+                                                                </tr>
+                                                            )
                                                             let opp = '—'
                                                             if (selectedSlate?.DfsSlateGames) {
                                                                 const game = selectedSlate.DfsSlateGames.find(sg => sg.SlateGameID === player.SlateGameID)
@@ -4745,11 +5419,28 @@ export default function Optimizer() {
                                                                                 {getInitials(player.OperatorPlayerName)}
                                                                             </div>
                                                                             <div>
-                                                                                <div className="text-xs font-semibold leading-tight"
-                                                                                    style={{ color: lineupStackTeam && player.Team === lineupStackTeam ? '#FFB800' : '#ffffff' }}>
-                                                                                    {player.OperatorPlayerName}
+                                                                                <div className="flex items-center gap-1.5">
+                                                                                    <span className="text-xs font-semibold leading-tight"
+                                                                                        style={{ color: lineupStackTeam && player.Team === lineupStackTeam ? '#FFB800' : '#ffffff' }}>
+                                                                                        {player.OperatorPlayerName}
+                                                                                    </span>
+                                                                                    {player.IsCaptain && (
+                                                                                        <span className="text-xs px-1.5 py-0.5 rounded font-black shrink-0"
+                                                                                            style={{
+                                                                                                background: 'rgba(255,184,0,0.2)',
+                                                                                                color: '#FFB800',
+                                                                                                border: '1px solid rgba(255,184,0,0.4)'
+                                                                                            }}>
+                                                                                            CPT 1.5x
+                                                                                        </span>
+                                                                                    )}
                                                                                 </div>
-                                                                                <div className="text-xs text-[#8A9BBE]">{player.Team}</div>
+                                                                                <div className="text-xs text-[#8A9BBE]">
+                                                                                    {player.Team}
+                                                                                    {player.IsCaptain && player.BaseProjectedPoints != null && (
+                                                                                        <span className="ml-1">· base {player.BaseProjectedPoints.toFixed(1)} pts</span>
+                                                                                    )}
+                                                                                </div>
                                                                             </div>
                                                                         </div>
                                                                     </td>
@@ -5442,6 +6133,125 @@ export default function Optimizer() {
                             {gameFiltersTab === 'rules' && (
                                 <div className="space-y-5">
 
+                                    {/* SHOWDOWN RULES — only show in showdown mode */}
+                                    {slateType === 'showdown' && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="flex items-center justify-between mb-3">
+                                                <div>
+                                                    <div className="text-sm font-bold text-white">
+                                                        🏈 Showdown Rules
+                                                    </div>
+                                                    <div className="text-xs text-[#8A9BBE] mt-0.5">
+                                                        Select rules to enforce across all lineups
+                                                    </div>
+                                                </div>
+                                                <div className="flex gap-2">
+                                                    <button
+                                                        onClick={() => setShowdownRules(SHOWDOWN_RULES.map(r => r.id))}
+                                                        className="text-xs text-[#8A9BBE] hover:text-[#FFB800] transition-colors">
+                                                        All
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setShowdownRules([])}
+                                                        className="text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors">
+                                                        Clear
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            {/* Group rules by category */}
+                                            {['captain', 'flex', 'construction'].map(cat => (
+                                                <div key={cat} className="mb-4">
+                                                    <div className="text-xs font-bold uppercase tracking-wider mb-2"
+                                                        style={{
+                                                            color: cat === 'captain' ? '#FFB800'
+                                                                : cat === 'flex' ? '#818CF8'
+                                                                    : '#22C55E'
+                                                        }}>
+                                                        {cat === 'captain' ? '⭐ Captain Rules'
+                                                            : cat === 'flex' ? '🔄 FLEX Rules'
+                                                                : '🏗 Construction Rules'}
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        {SHOWDOWN_RULES
+                                                            .filter(r => r.category === cat)
+                                                            .map(rule => {
+                                                                const isActive = showdownRules.includes(rule.id)
+                                                                return (
+                                                                    <button
+                                                                        key={rule.id}
+                                                                        onClick={() => toggleShowdownRule(rule.id)}
+                                                                        className="w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all"
+                                                                        style={{
+                                                                            background: isActive
+                                                                                ? cat === 'captain'
+                                                                                    ? 'rgba(255,184,0,0.08)'
+                                                                                    : cat === 'flex'
+                                                                                        ? 'rgba(99,102,241,0.08)'
+                                                                                        : 'rgba(34,197,94,0.08)'
+                                                                                : '#0A1628',
+                                                                            borderColor: isActive
+                                                                                ? cat === 'captain' ? '#FFB800'
+                                                                                    : cat === 'flex' ? '#818CF8'
+                                                                                        : '#22C55E'
+                                                                                : '#223366'
+                                                                        }}>
+                                                                        {/* Checkbox */}
+                                                                        <div className="w-5 h-5 rounded border-2 flex items-center justify-center shrink-0 mt-0.5 transition-all"
+                                                                            style={{
+                                                                                borderColor: isActive
+                                                                                    ? cat === 'captain' ? '#FFB800'
+                                                                                        : cat === 'flex' ? '#818CF8'
+                                                                                            : '#22C55E'
+                                                                                    : '#223366',
+                                                                                background: isActive
+                                                                                    ? cat === 'captain' ? '#FFB800'
+                                                                                        : cat === 'flex' ? '#818CF8'
+                                                                                            : '#22C55E'
+                                                                                    : 'transparent'
+                                                                            }}>
+                                                                            {isActive && (
+                                                                                <span className="text-xs font-black" style={{ color: '#0A1628' }}>
+                                                                                    ✓
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                        <div className="flex-1 min-w-0">
+                                                                            <div className="text-xs font-bold"
+                                                                                style={{
+                                                                                    color: isActive
+                                                                                        ? cat === 'captain' ? '#FFB800'
+                                                                                            : cat === 'flex' ? '#818CF8'
+                                                                                                : '#22C55E'
+                                                                                        : '#ffffff'
+                                                                                }}>
+                                                                                {rule.label}
+                                                                            </div>
+                                                                            <div className="text-xs text-[#8A9BBE] mt-0.5">
+                                                                                {rule.description}
+                                                                            </div>
+                                                                        </div>
+                                                                    </button>
+                                                                )
+                                                            })}
+                                                    </div>
+                                                </div>
+                                            ))}
+
+                                            {showdownRules.length > 0 && (
+                                                <div className="p-3 rounded-xl border border-[#223366] mt-2"
+                                                    style={{ background: '#132244' }}>
+                                                    <div className="text-xs text-[#8A9BBE]">
+                                                        <span className="text-[#FFB800] font-bold">
+                                                            {showdownRules.length} rules active
+                                                        </span>
+                                                        {' '}— applied to every lineup
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
                                     <div className="pb-4 border-b border-[#223366]">
                                         <div className="flex items-center gap-2 mb-2">
                                             <div className="text-xs font-bold text-white">Unique Players per Lineup</div>
@@ -5685,8 +6495,14 @@ export default function Optimizer() {
                         style={{ background: '#132244' }}>
                         <div className="flex items-center justify-between mb-4">
                             <div>
-                                <div className="text-lg font-black text-white">📄 Upload Manual Slate</div>
-                                <div className="text-xs text-[#8A9BBE] mt-1">Upload a DFF or custom CSV cheatsheet</div>
+                                <div className="text-lg font-black text-white">
+                                    {isShowdown ? '📄 Upload Showdown CSV' : '📄 Upload Manual Slate'}
+                                </div>
+                                <div className="text-xs text-[#8A9BBE] mt-1">
+                                    {isShowdown
+                                        ? 'Upload a DraftKings showdown player export or DFF showdown cheatsheet'
+                                        : 'Upload a DFF or custom CSV cheatsheet'}
+                                </div>
                             </div>
                             <button
                                 onClick={() => setShowSlateUpload(false)}
@@ -5700,46 +6516,80 @@ export default function Optimizer() {
                             style={{ borderColor: '#223366', background: '#0A1628' }}>
                             <div className="text-4xl mb-3">📄</div>
                             <div className="text-sm font-bold text-white mb-1">Click to upload CSV</div>
-                            <div className="text-xs text-[#8A9BBE] text-center px-4">
-                                Supports DFF cheatsheet format with columns:<br />
-                                {sport === 'nfl'
-                                    ? 'first_name, last_name, position, team, salary, ppg_projection, opp'
-                                    : 'first_name, last_name, position, team, salary, ppg_projection'}
-                            </div>
+                            {!isShowdown && (
+                                <div className="text-xs text-[#8A9BBE] text-center px-4">
+                                    Supports DFF cheatsheet format with columns:<br />
+                                    {sport === 'nfl'
+                                        ? 'first_name, last_name, position, team, salary, ppg_projection, opp'
+                                        : 'first_name, last_name, position, team, salary, ppg_projection'}
+                                </div>
+                            )}
                             <input type="file" accept=".csv" onChange={handleManualSlateUpload} className="hidden" />
                         </label>
 
-                        {sport === 'nfl' && (
-                            <div className="mt-4 p-3 rounded-lg border border-[#223366]"
-                                style={{ background: 'rgba(255,184,0,0.05)' }}>
-                                <div className="text-xs font-bold text-[#FFB800] mb-1">🏈 NFL position values</div>
-                                <div className="text-xs text-[#8A9BBE]">
-                                    position column: QB, RB, WR, TE, K, DST (or DEF / D/ST). For defense rows, first_name/last_name
-                                    can be left blank — the team name is used (e.g. &ldquo;Patriots D/ST&rdquo;).
+                        {isShowdown ? (
+                            <>
+                                <div className="mt-4 text-xs font-bold text-[#8A9BBE] uppercase tracking-wider mb-2">
+                                    Supported Formats
                                 </div>
-                            </div>
-                        )}
-
-                        <div className="mt-4 p-3 rounded-lg border border-[#223366]"
-                            style={{ background: '#0A1628' }}>
-                            <div className="text-xs font-bold text-[#8A9BBE] uppercase tracking-wider mb-2">
-                                Required Columns
-                            </div>
-                            <div className="flex flex-wrap gap-1">
-                                {(sport === 'nfl'
-                                    ? ['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection', 'opp', 'ownership_projection']
-                                    : ['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection']
-                                ).map(col => (
-                                    <span key={col} className="px-2 py-0.5 rounded text-xs font-mono"
-                                        style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800' }}>
-                                        {col}
+                                <div className="space-y-2 text-xs text-[#8A9BBE]">
+                                    <div>
+                                        <span className="text-[#FFB800] font-bold">DraftKings Export:</span>{' '}
+                                        Name, Position, Salary, TeamAbbrev, AvgPointsPerGame
+                                    </div>
+                                    <div>
+                                        <span className="text-[#FFB800] font-bold">DFF Format:</span>{' '}
+                                        first_name, last_name, position, team, salary, ppg_projection
+                                    </div>
+                                </div>
+                                <div className="mt-3 p-2 rounded-lg text-xs"
+                                    style={{
+                                        background: 'rgba(255,184,0,0.05)',
+                                        border: '1px solid rgba(255,184,0,0.2)'
+                                    }}>
+                                    <span className="text-[#FFB800] font-bold">Note:</span>
+                                    <span className="text-[#8A9BBE] ml-1">
+                                        The optimizer automatically creates CPT versions of all players at 1.5x salary
+                                        (and 1.5x projected points). Upload normal player data — no need for separate
+                                        CPT rows.
                                     </span>
-                                ))}
-                            </div>
-                            <div className="text-xs text-[#8A9BBE] mt-2">
-                                Optional: {sport === 'nfl' ? 'value_projection, confirmed_order, over_under, spread' : 'opp, ownership_projection, value_projection, confirmed_order, over_under, implied_team_score'}
-                            </div>
-                        </div>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                {sport === 'nfl' && (
+                                    <div className="mt-4 p-3 rounded-lg border border-[#223366]"
+                                        style={{ background: 'rgba(255,184,0,0.05)' }}>
+                                        <div className="text-xs font-bold text-[#FFB800] mb-1">🏈 NFL position values</div>
+                                        <div className="text-xs text-[#8A9BBE]">
+                                            position column: QB, RB, WR, TE, K, DST (or DEF / D/ST). For defense rows, first_name/last_name
+                                            can be left blank — the team name is used (e.g. &ldquo;Patriots D/ST&rdquo;).
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="mt-4 p-3 rounded-lg border border-[#223366]"
+                                    style={{ background: '#0A1628' }}>
+                                    <div className="text-xs font-bold text-[#8A9BBE] uppercase tracking-wider mb-2">
+                                        Required Columns
+                                    </div>
+                                    <div className="flex flex-wrap gap-1">
+                                        {(sport === 'nfl'
+                                            ? ['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection', 'opp', 'ownership_projection']
+                                            : ['first_name', 'last_name', 'position', 'team', 'salary', 'ppg_projection']
+                                        ).map(col => (
+                                            <span key={col} className="px-2 py-0.5 rounded text-xs font-mono"
+                                                style={{ background: 'rgba(255,184,0,0.1)', color: '#FFB800' }}>
+                                                {col}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    <div className="text-xs text-[#8A9BBE] mt-2">
+                                        Optional: {sport === 'nfl' ? 'value_projection, confirmed_order, over_under, spread' : 'opp, ownership_projection, value_projection, confirmed_order, over_under, implied_team_score'}
+                                    </div>
+                                </div>
+                            </>
+                        )}
                     </div>
                 </div>
             )}

@@ -57,6 +57,7 @@ def optimize():
         body = request.json
         players = body.get('players', [])
         slots = body.get('slots', [])
+        is_showdown = body.get('isShowdown', False)
 
         # DEBUG logging
         print(f"\n{'='*50}")
@@ -115,6 +116,15 @@ def optimize():
         # Add locked flag
         for p in players:
             p['locked'] = p['slatePlayerId'] in locked_ids
+
+        # Normalize showdown fields — tolerate either casing in case a caller
+        # sends the frontend's original PascalCase names instead of camelCase.
+        for p in players:
+            if 'isCaptain' not in p:
+                roster_slots = p.get('operatorRosterSlots', []) or []
+                p['isCaptain'] = 'CPT' in roster_slots
+            if 'captainBaseId' not in p:
+                p['captainBaseId'] = p.get('CaptainBaseId')
 
         # Compute GPP score
         players = compute_gpp_score(players)
@@ -215,6 +225,17 @@ def optimize():
         # would misclassify NBA slates as NFL/MLB. operatorPosition values
         # (QB/RB/WR/TE/DST/DEF) are unambiguous across all three sports.
         is_mlb = not is_nfl
+
+        if is_showdown:
+            # Showdown players still carry real NFL positions (QB/RB/WR/TE/K/
+            # DST), so the position-based is_nfl check above would already be
+            # True — but the classic NFL slot logic expects QB/RB/WR/TE/FLEX/
+            # DST slots, not the CPT/FLEX slots a showdown request actually
+            # sends. Force both off so neither classic branch runs.
+            is_nfl = False
+            is_mlb = False
+            print("Mode: NFL Showdown")
+
         stack_min_size = 3 if is_nfl else 5  # NFL: QB + 2 pass catchers minimum
 
         lineup_num = 0
@@ -533,6 +554,392 @@ def optimize():
                     model.Add(sum(vars_list[i] for i in dst_eligible) == slot_counts[dst_slot])
 
                 print(f"NFL slot constraints applied: {slot_counts}")
+            elif is_showdown:
+                # Showdown: CPT + 5 FLEX. This branch is fully self-contained —
+                # it builds its own salary/objective/diversity constraints and
+                # solves/accepts the lineup itself, then `continue`s straight
+                # to the next while-loop iteration. That's deliberate: none of
+                # the classic MLB/NFL constraints below (team stacks, bring-
+                # back, anti-correlation, per-game caps) apply to a single-game
+                # showdown slate, and skipping them via `continue` is simpler
+                # and less error-prone than gating every one of those blocks
+                # with "and not is_showdown".
+                cpt_indices = [
+                    i for i in range(n)
+                    if players[i].get('operatorRosterSlots') and
+                    'CPT' in players[i].get('operatorRosterSlots', [])
+                ]
+                flex_indices = [
+                    i for i in range(n)
+                    if players[i].get('operatorRosterSlots') and
+                    'FLEX' in players[i].get('operatorRosterSlots', [])
+                ]
+
+                print(f"Showdown: {len(cpt_indices)} CPT options, "
+                      f"{len(flex_indices)} FLEX options")
+
+                # Prevent same player appearing as both CPT and FLEX.
+                # CPT entries now carry an ID of baseId + 100000, but we still
+                # key off captainBaseId/slatePlayerId (rather than reversing
+                # the ID arithmetic) so this keeps working regardless of how
+                # the frontend derives a CPT entry's ID.
+                for i in cpt_indices:
+                    base_id = players[i].get('captainBaseId')
+                    if base_id is None:
+                        continue
+                    # Find the FLEX version of the same player
+                    flex_version = next((
+                        j for j in flex_indices
+                        if players[j].get('slatePlayerId') == base_id
+                    ), None)
+                    if flex_version is not None:
+                        model.Add(
+                            vars_list[i] + vars_list[flex_version] <= 1
+                        )
+
+                # Exactly 1 CPT
+                if cpt_indices:
+                    model.Add(
+                        sum(vars_list[i] for i in cpt_indices) == 1
+                    )
+
+                # Exactly 5 FLEX
+                if flex_indices:
+                    model.Add(
+                        sum(vars_list[i] for i in flex_indices) == len(slots) - 1
+                    )
+
+                # Total 6 players
+                model.Add(sum(vars_list) == len(slots))
+
+                # Salary constraint
+                salary_expr = sum(
+                    vars_list[i] * int(
+                        players[i].get('operatorSalary', 0) or 0
+                    )
+                    for i in range(n)
+                )
+                model.Add(salary_expr >= min_salary - 1000)
+                model.Add(salary_expr <= max_salary)
+
+                # Extract showdown rules from request
+                showdown_rules = set(body.get('showdownRules', []))
+                print(f"Showdown rules active: {showdown_rules}")
+
+                # Build helper lookups
+                def get_ownership(p):
+                    return float(p.get('ownershipProjection') or 0)
+
+                def get_proj(p):
+                    return float(p.get('projectedPoints') or 0)
+
+                skill_positions = ['QB', 'RB', 'WR', 'TE']
+
+                # ── RULE: cpt_skill_only ──────────────────────────
+                # Captain must be QB, RB, WR, or TE
+                if 'cpt_skill_only' in showdown_rules:
+                    non_skill_cpt = [
+                        i for i in cpt_indices
+                        if players[i].get('operatorPosition', '')
+                           not in skill_positions
+                    ]
+                    for i in non_skill_cpt:
+                        model.Add(vars_list[i] == 0)
+                    print(f"Rule cpt_skill_only: blocked "
+                          f"{len(non_skill_cpt)} non-skill CPT options")
+
+                # ── RULE: no_dst_cpt ─────────────────────────────
+                if 'no_dst_cpt' in showdown_rules:
+                    dst_cpt = [
+                        i for i in cpt_indices
+                        if players[i].get('operatorPosition', '')
+                           in ['DST', 'DEF', 'D/ST']
+                    ]
+                    for i in dst_cpt:
+                        model.Add(vars_list[i] == 0)
+                    print(f"Rule no_dst_cpt: blocked {len(dst_cpt)}")
+
+                # ── RULE: no_kicker_cpt ──────────────────────────
+                if 'no_kicker_cpt' in showdown_rules:
+                    k_cpt = [
+                        i for i in cpt_indices
+                        if players[i].get('operatorPosition', '') == 'K'
+                    ]
+                    for i in k_cpt:
+                        model.Add(vars_list[i] == 0)
+                    print(f"Rule no_kicker_cpt: blocked {len(k_cpt)}")
+
+                # ── RULE: cpt_low_own ────────────────────────────
+                # CPT must be under 20% ownership — but never block every
+                # captain option outright: a CP-SAT constraint, once added,
+                # can't be un-added later, so the "would this leave zero
+                # options" check has to happen BEFORE adding anything.
+                if 'cpt_low_own' in showdown_rules:
+                    high_own_cpt = [
+                        i for i in cpt_indices
+                        if get_ownership(players[i]) >= 20
+                    ]
+                    remaining_cpt = len(cpt_indices) - len(high_own_cpt)
+                    if remaining_cpt == 0:
+                        print("WARNING: cpt_low_own would block all captains — "
+                              "skipping this rule")
+                    else:
+                        for i in high_own_cpt:
+                            model.Add(vars_list[i] == 0)
+                        print(f"Rule cpt_low_own: blocked {len(high_own_cpt)} "
+                              f"high-own CPTs, {remaining_cpt} remain")
+
+                # ── RULE: cpt_high_proj ──────────────────────────
+                # CPT must be top 5 projected
+                if 'cpt_high_proj' in showdown_rules:
+                    sorted_by_proj = sorted(
+                        range(n),
+                        key=lambda i: get_proj(players[i]),
+                        reverse=True
+                    )
+                    top5_ids = set(sorted_by_proj[:5])
+                    low_proj_cpt = [
+                        i for i in cpt_indices
+                        if i not in top5_ids
+                    ]
+                    # Only block if enough top5 CPT options remain
+                    top5_cpt = [i for i in cpt_indices if i in top5_ids]
+                    if top5_cpt:
+                        for i in low_proj_cpt:
+                            model.Add(vars_list[i] == 0)
+                        print(f"Rule cpt_high_proj: {len(top5_cpt)} "
+                              f"top-5 CPT options")
+
+                # ── RULE: flex_one_low_own ───────────────────────
+                # At least 1 FLEX under 20% ownership
+                if 'flex_one_low_own' in showdown_rules:
+                    low_own_flex = [
+                        i for i in flex_indices
+                        if get_ownership(players[i]) < 20
+                    ]
+                    if low_own_flex:
+                        model.Add(
+                            sum(vars_list[i] for i in low_own_flex) >= 1
+                        )
+                        print(f"Rule flex_one_low_own: "
+                              f"{len(low_own_flex)} eligible")
+                    else:
+                        print("Rule flex_one_low_own: no low-own FLEX "
+                              "available — skipping")
+
+                # ── RULE: flex_min_own ───────────────────────────
+                # All FLEX must be at least 5% owned
+                if 'flex_min_own' in showdown_rules:
+                    zero_own_flex = [
+                        i for i in flex_indices
+                        if get_ownership(players[i]) < 5
+                    ]
+                    for i in zero_own_flex:
+                        model.Add(vars_list[i] == 0)
+                    print(f"Rule flex_min_own: blocked "
+                          f"{len(zero_own_flex)} under-5% FLEX")
+
+                # ── RULE: must_have_qb_or_dst ────────────────────
+                if 'must_have_qb_or_dst' in showdown_rules:
+                    qb_dst_all = [
+                        i for i in range(n)
+                        if players[i].get('operatorPosition', '')
+                           in ['QB', 'DST', 'DEF']
+                    ]
+                    if qb_dst_all:
+                        model.Add(
+                            sum(vars_list[i] for i in qb_dst_all) >= 1
+                        )
+                        print(f"Rule must_have_qb_or_dst: "
+                              f"{len(qb_dst_all)} eligible")
+
+                # ── RULE: stack_same_team ────────────────────────
+                if 'stack_same_team' in showdown_rules:
+                    teams_in_pool = list(set(
+                        p.get('team', '') for p in players
+                        if p.get('team')
+                    ))
+                    if len(teams_in_pool) >= 2:
+                        team_vars = {
+                            team: model.NewBoolVar(f'stack_{team}')
+                            for team in teams_in_pool
+                        }
+                        model.Add(sum(team_vars.values()) >= 1)
+                        for team, team_var in team_vars.items():
+                            team_indices = [
+                                i for i in range(n)
+                                if players[i].get('team') == team
+                            ]
+                            model.Add(
+                                sum(vars_list[i] for i in team_indices) >= 3
+                            ).OnlyEnforceIf(team_var)
+                            model.Add(
+                                sum(vars_list[i] for i in team_indices) <= 2
+                            ).OnlyEnforceIf(team_var.Not())
+                        print("Rule stack_same_team: min 3 from one team")
+
+                # ── RULE: both_teams ─────────────────────────────
+                if 'both_teams' in showdown_rules:
+                    teams_in_pool = list(set(
+                        p.get('team', '') for p in players
+                        if p.get('team')
+                    ))
+                    for team in teams_in_pool:
+                        team_indices = [
+                            i for i in range(n)
+                            if players[i].get('team') == team
+                        ]
+                        if team_indices:
+                            model.Add(
+                                sum(vars_list[i] for i in team_indices) >= 1
+                            )
+                    print(f"Rule both_teams: must include all "
+                          f"{len(teams_in_pool)} teams")
+
+                print("Showdown rules applied. Solving...")
+
+                # Showdown objective: maximize GPP score with captain boost
+                # for high-ceiling players
+                objective_terms = []
+                for i in range(n):
+                    base_score = int(
+                        (players[i].get('gpp_score', 0) or 0) * 100
+                    )
+                    usage_penalty = player_usage_count.get(i, 0) * 20
+                    random_noise = random.randint(-10, 10)
+
+                    # Extra noise for captain slot (encourage variety in captain picks)
+                    is_cpt = 'CPT' in (
+                        players[i].get('operatorRosterSlots') or []
+                    )
+                    # For CPT slot add projection-weighted boost
+                    # so high-projection players get captained more
+                    if is_cpt:
+                        proj = float(players[i].get('projectedPoints') or 0)
+                        cpt_boost = int(proj * 10)
+                        cpt_noise = random.randint(-20, 20)
+                    else:
+                        cpt_boost = 0
+                        cpt_noise = 0
+
+                    adjusted = max(
+                        base_score - usage_penalty + random_noise +
+                        cpt_boost + cpt_noise,
+                        1
+                    )
+                    objective_terms.append(vars_list[i] * adjusted)
+
+                model.Maximize(sum(objective_terms))
+
+                # Diversity for showdown
+                for prev in previous_lineups[-20:]:
+                    model.Add(
+                        sum(vars_list[i] for i in prev)
+                        <= len(slots) - min_unique
+                    )
+
+                # Solve
+                status = solver_obj.Solve(model)
+
+                if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    selected = [
+                        i for i in range(n)
+                        if solver_obj.Value(vars_list[i])
+                    ]
+                    lineup_key = tuple(sorted(selected))
+
+                    if lineup_key in seen_lineups:
+                        consecutive_failures += 1
+                        continue
+
+                    seen_lineups.add(lineup_key)
+                    previous_lineups.append(selected)
+
+                    lineup_players = [players[i] for i in selected]
+
+                    # Validate showdown lineup has exactly 6 players. The
+                    # CP-SAT constraints above already guarantee this, but a
+                    # solved-but-malformed lineup is exactly the kind of thing
+                    # that should never silently reach the frontend.
+                    if len(lineup_players) != 6:
+                        print(f"WARNING: Showdown lineup has "
+                              f"{len(lineup_players)} players, expected 6")
+                        consecutive_failures += 1
+                        continue
+
+                    # Validate exactly 1 CPT and 5 FLEX
+                    cpt_count = sum(1 for p in lineup_players
+                        if 'CPT' in (p.get('operatorRosterSlots') or []))
+                    flex_count = sum(1 for p in lineup_players
+                        if 'FLEX' in (p.get('operatorRosterSlots') or []))
+
+                    if cpt_count != 1 or flex_count != 5:
+                        print(f"WARNING: Invalid showdown lineup - "
+                              f"CPT:{cpt_count} FLEX:{flex_count}")
+                        consecutive_failures += 1
+                        continue
+
+                    total_salary = sum(
+                        p.get('operatorSalary', 0) or 0
+                        for p in lineup_players
+                    )
+                    total_proj = sum(
+                        p.get('projectedPoints', 0) or 0
+                        for p in lineup_players
+                    )
+
+                    # Find the captain
+                    captain = next((
+                        p for p in lineup_players
+                        if 'CPT' in (p.get('operatorRosterSlots') or [])
+                    ), None)
+
+                    print(f"Showdown lineup {lineup_num+1}: "
+                          f"CPT={captain.get('operatorPlayerName', '?') if captain else '?'} "
+                          f"Salary=${total_salary:,}")
+                    print(f"✓ Showdown lineup valid: "
+                          f"CPT:{cpt_count} FLEX:{flex_count} "
+                          f"Total:${total_salary:,}")
+
+                    all_lineups.append({
+                        'players': [
+                            {
+                                'slatePlayerId': p.get('slatePlayerId'),
+                                'captainBaseId': p.get('captainBaseId'),
+                                'operatorPlayerName': (
+                                    (p.get('operatorPlayerName') or '')
+                                    .replace(' (CPT)', '')
+                                    .strip()
+                                ),
+                                'operatorPosition': p.get('operatorPosition'),
+                                'operatorSalary': p.get('operatorSalary'),
+                                'operatorRosterSlots': p.get('operatorRosterSlots', []),
+                                'team': p.get('team'),
+                                'projectedPoints': p.get('projectedPoints'),
+                                'isCaptain': bool(p.get('isCaptain', False)),
+                                'slot': 'CPT' if p.get('isCaptain') else 'FLEX'
+                            }
+                            for p in lineup_players
+                        ],
+                        'totalSalary': total_salary,
+                        'projectedPoints': round(total_proj, 2)
+                    })
+
+                    for idx in selected:
+                        player_usage_count[idx] = (
+                            player_usage_count.get(idx, 0) + 1
+                        )
+
+                    lineup_num += 1
+                    consecutive_failures = 0
+
+                else:
+                    consecutive_failures += 1
+                    print(f"Showdown INFEASIBLE attempt {attempt}")
+                    continue
+
+                # Skip the rest of the loop for showdown
+                continue
             else:
                 for slot, count in slot_counts.items():
                     if slot == 'P':
@@ -975,7 +1382,12 @@ def optimize():
                   f"(stack + fill pool + exclusions leave too few valid combinations).")
 
         # ─── POST-GENERATION EXPOSURE REBALANCE ─────────────────
-        if ownership_targets and all_lineups:
+        # Skip rebalance for showdown — CPT/FLEX dual IDs cause circular
+        # swap corruption. Showdown has its own captain-exclusivity and
+        # slot-count invariants (enforced at solve time above) that this
+        # generic swap-based rebalance knows nothing about — it would
+        # cheerfully swap a lineup's only CPT for someone's FLEX entry.
+        if ownership_targets and all_lineups and not is_showdown:
             total_lineups = len(all_lineups)
             print(f"\n=== EXPOSURE REBALANCE (target vs actual) ===")
             print(f"Total lineups to rebalance: {total_lineups}")
@@ -1006,6 +1418,15 @@ def optimize():
                     return result
                 return bool(slots(pos_a) & slots(pos_b))
 
+            # Track players added/removed within THIS rebalance pass so one
+            # player's fix can't immediately undo another's: without this, a
+            # player swapped in to satisfy one target could get picked right
+            # back out as a "replacement" for a different target's removal
+            # (or vice versa), quietly overshooting both targets in a way
+            # that looks like players ping-ponging between lineups.
+            recently_added = set()
+            recently_removed = set()
+
             for pid_str, target_pct in ownership_targets.items():
                 target_pct = float(target_pct)
                 if target_pct <= 0:
@@ -1013,6 +1434,16 @@ def optimize():
 
                 current_pct = get_exposure(all_lineups, pid_str)
                 target_count = round(target_pct / 100 * total_lineups)
+                # For very small lineup sets, round() alone rounds too
+                # aggressively (e.g. a 20% target with 3 lineups rounds up to
+                # "1 of 3" = 33%) — treat sub-one-lineup targets as 0 instead.
+                if total_lineups <= 5:
+                    # With few lineups ownership targets are approximate —
+                    # don't try to force exact counts
+                    if target_pct < (100 / total_lineups):
+                        target_count = 0
+                    elif target_pct >= (100 / total_lineups):
+                        target_count = max(0, min(target_count, total_lineups))
                 current_count = round(current_pct / 100 * total_lineups)
 
                 print(f"\n--- Player {pid_str} ---")
@@ -1100,6 +1531,10 @@ def optimize():
 
                             if p_id == pid_str:
                                 continue
+                            # Skip if this candidate was just removed in this
+                            # rebalance pass (prevents circular swaps)
+                            if p_id in recently_removed:
+                                continue
                             if not pos_compatible(target_pos, p_pos):
                                 continue
                             if (stack_team_lu and p_team == stack_team_lu and stack_count <= 5):
@@ -1117,6 +1552,7 @@ def optimize():
                                 for pp in lu_players
                             ]
                             added += 1
+                            recently_added.add(pid_str)
                             swap_found = True
                             print(f"    Strategy1 SWAP: {p_data.get('operatorPlayerName')} → {target_player.get('operatorPlayerName')} salary ${current_salary} → ${new_salary}")
                             break
@@ -1129,7 +1565,8 @@ def optimize():
                             print(f"    Strategy2: stack has {stack_count} players, looking for excess to remove")
                             stack_players_same_pos = [
                                 p for p in lu_players
-                                if (player_by_id.get(str(p.get('slatePlayerId')), {}).get('team') == stack_team_lu
+                                if (str(p.get('slatePlayerId')) not in recently_removed
+                                    and player_by_id.get(str(p.get('slatePlayerId')), {}).get('team') == stack_team_lu
                                     and pos_compatible(
                                         target_pos,
                                         player_by_id.get(str(p.get('slatePlayerId')), {}).get('operatorPosition', '')
@@ -1153,6 +1590,7 @@ def optimize():
                                         for pp in lu_players
                                     ]
                                     added += 1
+                                    recently_added.add(pid_str)
                                     swap_found = True
                                     print(f"    Strategy2 SWAP: {w_data.get('operatorPlayerName')} → {target_player.get('operatorPlayerName')}")
 
@@ -1167,6 +1605,10 @@ def optimize():
                                 p_pos = p_data.get('operatorPosition', '')
 
                                 if p_id == pid_str:
+                                    continue
+                                # Skip if this candidate was just removed in
+                                # this rebalance pass (prevents circular swaps)
+                                if p_id in recently_removed:
                                     continue
                                 if p_pos in ['SP', 'RP']:
                                     continue
@@ -1183,6 +1625,7 @@ def optimize():
                                     for pp in lu_players
                                 ]
                                 added += 1
+                                recently_added.add(pid_str)
                                 swap_found = True
                                 print(f"    Strategy3 SWAP: {p_data.get('operatorPlayerName')} ({p_pos}) → {target_player.get('operatorPlayerName')} ({target_pos})")
                                 break
@@ -1224,6 +1667,10 @@ def optimize():
                             cand_id = str(cand.get('slatePlayerId'))
                             if cand_id in used_ids or cand_id == pid_str:
                                 continue
+                            # Skip if this replacement was just added in this
+                            # rebalance pass (prevents circular swaps)
+                            if cand_id in recently_added:
+                                continue
                             if not pos_compatible(target_pos, cand.get('operatorPosition', '')):
                                 continue
                             new_salary = current_salary - target_salary + cand.get('operatorSalary', 0)
@@ -1244,6 +1691,7 @@ def optimize():
                                 for p in lu_players
                             ]
                             removed += 1
+                            recently_removed.add(pid_str)
                             print(f"  Removed {pid_str} → {rep_id} in lineup {lu_idx + 1}")
 
                     print(f"  Removed from {removed} lineups")

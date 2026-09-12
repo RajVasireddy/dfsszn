@@ -98,6 +98,9 @@ def optimize():
         locked_player_ids = set(normalize_id(x) for x in body.get('lockedPlayerIds', []))
         pitcher_pool_ids = set(str(x) for x in body.get('pitcherPoolIds', []))
         common_pool_ids = set(str(x) for x in body.get('commonPoolIds', []))
+        showdown_pool_min = body.get('showdownPoolMin', None)
+        print(f"Showdown pool min: {showdown_pool_min}, "
+              f"pool size: {len(common_pool_ids)}")
         print(f"Locked players: {locked_player_ids}")
         print(f"Pitcher pool: {len(pitcher_pool_ids)} players")
         print(f"Common pool: {len(common_pool_ids)} players")
@@ -387,7 +390,12 @@ def optimize():
 
             # COMMON POOL WHITELIST (DST/DEF/K are unique single-copy positions —
             # never let a whitelist built from hitters/pass-catchers exclude them)
-            if common_pool_ids:
+            # Showdown is excluded here: its common pool is a minimum-inclusion
+            # constraint ("at least N of these must appear"), not a hard
+            # whitelist — see SHOWDOWN COMMON POOL MINIMUM below. Applying this
+            # whitelist too would lock every non-pool player to 0, which for a
+            # 6-player showdown roster is almost always instantly infeasible.
+            if common_pool_ids and not is_showdown:
                 for i in hitter_indices:
                     pid = str(players[i].get('slatePlayerId', ''))
                     # normalize_id() here, not the raw pid above, so this matches
@@ -428,8 +436,9 @@ def optimize():
                 )
 
             # Common pool whitelist: non-locked hitters must come from common pool
-            # (DST/DEF/K exempted — see COMMON POOL WHITELIST above)
-            if common_pool_ids:
+            # (DST/DEF/K exempted — see COMMON POOL WHITELIST above). Same
+            # showdown exclusion as above.
+            if common_pool_ids and not is_showdown:
                 for i in hitter_indices:
                     pid = str(players[i].get('slatePlayerId', ''))
                     p_pos = players[i].get('operatorPosition', '')
@@ -778,8 +787,9 @@ def optimize():
                             ).OnlyEnforceIf(team_var.Not())
                         print("Rule stack_same_team: min 3 from one team")
 
-                # ── RULE: both_teams ─────────────────────────────
-                if 'both_teams' in showdown_rules:
+                # ── RULE: both_teams / both_teams_required ───────
+                if 'both_teams' in showdown_rules or \
+                   'both_teams_required' in showdown_rules:
                     teams_in_pool = list(set(
                         p.get('team', '') for p in players
                         if p.get('team')
@@ -796,7 +806,146 @@ def optimize():
                     print(f"Rule both_teams: must include all "
                           f"{len(teams_in_pool)} teams")
 
+                # ── RULE: qb_cpt_stack ───────────────────────────
+                # If QB is captain, require 2+ teammates in FLEX
+                if 'qb_cpt_stack' in showdown_rules:
+                    print("Rule qb_cpt_stack: enforcing QB captain "
+                          "teammate correlation")
+
+                    # Get all QB CPT options
+                    qb_cpt_indices = [
+                        i for i in cpt_indices
+                        if players[i].get('operatorPosition') == 'QB'
+                    ]
+
+                    if not qb_cpt_indices:
+                        print("  No QB CPT options available — "
+                              "skipping qb_cpt_stack rule")
+                    else:
+                        # For each possible QB captain, create a
+                        # binary variable and conditional constraints
+                        for qb_idx in qb_cpt_indices:
+                            qb_team = players[qb_idx].get('team', '')
+
+                            # Find FLEX teammates (WR/RB/TE/K from same team)
+                            teammate_flex = [
+                                i for i in flex_indices
+                                if players[i].get('team') == qb_team
+                                and players[i].get('operatorPosition')
+                                    in ['WR', 'RB', 'TE', 'K']
+                            ]
+
+                            print(f"  QB {players[qb_idx].get('operatorPlayerName')} "
+                                  f"({qb_team}): "
+                                  f"{len(teammate_flex)} eligible teammates")
+
+                            if len(teammate_flex) >= 2:
+                                # If this QB is the captain,
+                                # enforce 2+ teammates in FLEX
+                                # Use OnlyEnforceIf for conditional constraint
+                                qb_is_cpt = model.NewBoolVar(
+                                    f'qb_is_cpt_{qb_idx}'
+                                )
+
+                                # qb_is_cpt is True when this QB is selected
+                                model.Add(
+                                    vars_list[qb_idx] == 1
+                                ).OnlyEnforceIf(qb_is_cpt)
+                                model.Add(
+                                    vars_list[qb_idx] == 0
+                                ).OnlyEnforceIf(qb_is_cpt.Not())
+
+                                # When this QB is captain,
+                                # require 2+ teammates
+                                model.Add(
+                                    sum(vars_list[i]
+                                        for i in teammate_flex) >= 2
+                                ).OnlyEnforceIf(qb_is_cpt)
+
+                                print(f"  Conditional: if {players[qb_idx].get('operatorPlayerName')} "
+                                      f"is CPT → 2+ from {qb_team} in FLEX")
+
+                            elif len(teammate_flex) == 1:
+                                # Only 1 teammate available — require 1
+                                qb_is_cpt = model.NewBoolVar(
+                                    f'qb_is_cpt_{qb_idx}'
+                                )
+                                model.Add(
+                                    vars_list[qb_idx] == 1
+                                ).OnlyEnforceIf(qb_is_cpt)
+                                model.Add(
+                                    vars_list[qb_idx] == 0
+                                ).OnlyEnforceIf(qb_is_cpt.Not())
+                                model.Add(
+                                    sum(vars_list[i]
+                                        for i in teammate_flex) >= 1
+                                ).OnlyEnforceIf(qb_is_cpt)
+
+                                print(f"  Only 1 teammate available — "
+                                      f"requiring 1 when {players[qb_idx].get('operatorPlayerName')} "
+                                      f"is CPT")
+
+                            else:
+                                # No teammates available for this QB
+                                # Block this QB from being captain
+                                # to avoid unenforceable constraint
+                                model.Add(vars_list[qb_idx] == 0)
+                                print(f"  No teammates for {players[qb_idx].get('operatorPlayerName')} "
+                                      f"— blocked as CPT")
+
+                        # Also handle the case where a NON-QB is captain
+                        # (rule only applies when QB is CPT so no
+                        # additional constraint needed for other CPTs)
+
+                        non_qb_cpt = [
+                            i for i in cpt_indices
+                            if players[i].get('operatorPosition') != 'QB'
+                        ]
+                        print(f"  Non-QB CPT options (unrestricted): "
+                              f"{len(non_qb_cpt)}")
+
                 print("Showdown rules applied. Solving...")
+
+                # ── SHOWDOWN COMMON POOL MINIMUM ─────────────────
+                if showdown_pool_min and common_pool_ids:
+                    # Find all players (CPT or FLEX) in the pool
+                    pool_player_indices = [
+                        i for i in range(n)
+                        if str(players[i].get('slatePlayerId', ''))
+                           in common_pool_ids
+                        or str(players[i].get('captainBaseId', ''))
+                           in common_pool_ids
+                    ]
+
+                    # Clamp against the number of DISTINCT real players, not
+                    # the raw index count above — each real player contributes
+                    # two rows (FLEX + CPT), but the CPT/FLEX exclusivity
+                    # constraint means at most one of those two can ever be
+                    # selected. Clamping against the doubled count would let
+                    # actual_min exceed what's actually achievable and force
+                    # the model infeasible whenever the pool has 2+ players.
+                    pool_base_ids = set()
+                    for i in pool_player_indices:
+                        slate_id = str(players[i].get('slatePlayerId', ''))
+                        base_id = str(players[i].get('captainBaseId', ''))
+                        pool_base_ids.add(slate_id if slate_id in common_pool_ids else base_id)
+
+                    actual_min = min(
+                        showdown_pool_min,
+                        len(pool_base_ids)
+                    )
+
+                    if pool_player_indices and actual_min > 0:
+                        model.Add(
+                            sum(vars_list[i]
+                                for i in pool_player_indices)
+                            >= actual_min
+                        )
+                        print(f"Showdown pool constraint: "
+                              f">= {actual_min} from pool "
+                              f"({len(pool_player_indices)} eligible)")
+                    else:
+                        print(f"Showdown pool: no eligible players found")
 
                 # Showdown objective: maximize GPP score with captain boost
                 # for high-ceiling players

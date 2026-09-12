@@ -6,7 +6,7 @@ export default function Optimizer() {
     const [sport, setSport] = useState('mlb')
     const [platform, setPlatform] = useState('draftkings')
     const [slateType, setSlateType] = useState('classic') // 'classic' or 'showdown' — NFL DK only
-    const [showdownRules, setShowdownRules] = useState([]) // array of active SHOWDOWN_RULES ids
+    const [showdownRules, setShowdownRules] = useState(['both_teams_required']) // array of active SHOWDOWN_RULES ids
     const [slates, setSlates] = useState([])
     const [selectedSlate, setSelectedSlate] = useState(null)
     const [players, setPlayers] = useState([])
@@ -88,6 +88,9 @@ export default function Optimizer() {
     const [selectedLineupIndices, setSelectedLineupIndices] = useState(new Set())
     const [sentToMyLineups, setSentToMyLineups] = useState(false)
     const [stackFilter, setStackFilter] = useState(null)
+    const [lineupSortBy, setLineupSortBy] = useState('projected_desc')
+    const [lineupMinProj, setLineupMinProj] = useState('')
+    const [lineupMaxSalary, setLineupMaxSalary] = useState('')
     const [aiAnalysis, setAiAnalysis] = useState(null)
     const [aiLoading, setAiLoading] = useState(false)
     const [showAiPanel, setShowAiPanel] = useState(false)
@@ -103,6 +106,7 @@ export default function Optimizer() {
     const [multiStackRules, setMultiStackRules] = useState([])
     const [pitcherPool, setPitcherPool] = useState([])
     const [commonPool, setCommonPool] = useState([])
+    const [showdownPoolMin, setShowdownPoolMin] = useState(3) // showdown only — min commonPool players required per lineup
     const [globalExposureCaps, setGlobalExposureCaps] = useState({})
     const [globalExposureActual, setGlobalExposureActual] = useState({})
     const [allGeneratedLineups, setAllGeneratedLineups] = useState([])
@@ -217,6 +221,13 @@ export default function Optimizer() {
             category: 'construction'
         },
         {
+            id: 'both_teams_required',
+            label: 'Players From Both Teams (Default)',
+            description: 'Every lineup must have at least 1 player from each team in the game',
+            category: 'construction',
+            defaultOn: true,
+        },
+        {
             id: 'no_dst_cpt',
             label: 'No DST as Captain',
             description: 'DST cannot be placed in the CPT slot',
@@ -232,6 +243,12 @@ export default function Optimizer() {
             id: 'no_kicker_cpt',
             label: 'No Kicker as Captain',
             description: 'Kicker cannot be placed in the CPT slot',
+            category: 'captain'
+        },
+        {
+            id: 'qb_cpt_stack',
+            label: 'QB Captain = 2 Teammates in FLEX',
+            description: 'If QB is the captain, at least 2 of his teammates (WR/RB/TE/K) must be in FLEX slots',
             category: 'captain'
         },
     ]
@@ -492,6 +509,11 @@ export default function Optimizer() {
         setPosFilter('ALL')
         setStackBuilderPosFilter('ALL')
         setStackBuilderSearch('')
+        // The Pitchers tab is MLB-only and Stacks is classic-only — switching
+        // away from either could leave gameFiltersTab pointed at a now-hidden
+        // tab with no button left to select it back, so land on Stacks (always
+        // valid for classic) rather than leaving it stale.
+        setGameFiltersTab('stacks')
         setAiAnalysis(null)
         setAiSuggestions(null)
         setError(null)
@@ -1294,6 +1316,7 @@ export default function Optimizer() {
                     excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
                     pitcherPoolIds: pitcherPool.map(p => p.SlatePlayerID),
                     commonPoolIds: commonPool.map(p => p.SlatePlayerID),
+                    showdownPoolMin: slateType === 'showdown' ? showdownPoolMin : null,
                     playersPerTeamMax,
                     playersPerGameMax,
                     hittersVsPitcher,
@@ -1377,6 +1400,10 @@ export default function Optimizer() {
             )
 
             setLineups(paddedLineups)
+            setLineupSortBy('projected_desc')
+            setLineupMinProj('')
+            setLineupMaxSalary('')
+            setStackFilter(null)
             setActiveLineup(0)
             setLineupCount(data.generated)
 
@@ -2118,6 +2145,7 @@ export default function Optimizer() {
                 excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
                 pitcherPoolIds: pitcherPool.map(p => p.SlatePlayerID),
                 commonPoolIds: commonPool.map(p => p.SlatePlayerID),
+                showdownPoolMin: slateType === 'showdown' ? showdownPoolMin : null,
                 fillPoolIds: fillPool.map(p => p.SlatePlayerID),
                 stackTeam: stackTeam || null,
                 stackSize: stackTeam ? 5 : 0,
@@ -2161,6 +2189,10 @@ export default function Optimizer() {
             const combined = [...existingValid, ...newLineups]
 
             setLineups(combined)
+            setLineupSortBy('projected_desc')
+            setLineupMinProj('')
+            setLineupMaxSalary('')
+            setStackFilter(null)
             setLineupCount(combined.length)
             setActiveLineup(existingValid.length)
 
@@ -2845,6 +2877,7 @@ export default function Optimizer() {
                     excludedIds: legacyRules.excludedPlayers.map(p => p.SlatePlayerID),
                     pitcherPoolIds: pitcherPool.length > 0 ? pitcherPool.map(p => p.SlatePlayerID) : [],
                     commonPoolIds: commonPool.length > 0 ? commonPool.map(p => p.SlatePlayerID) : [],
+                    showdownPoolMin: slateType === 'showdown' ? showdownPoolMin : null,
                     fillPoolIds: fillPool.map(p => p.SlatePlayerID),
                     stackTeam: stack.team || null,
                     stackTeamSize: 5,
@@ -2883,6 +2916,10 @@ export default function Optimizer() {
                 const existing = prev.filter(l => l && l.some(p => p !== null))
                 return [...existing, ...generatedLineups]
             })
+            setLineupSortBy('projected_desc')
+            setLineupMinProj('')
+            setLineupMaxSalary('')
+            setStackFilter(null)
             setLineupCount(prev => prev + generatedLineups.length)
 
         } catch (err) {
@@ -3053,6 +3090,7 @@ export default function Optimizer() {
                 stackTeam,
                 legacyRules,
                 showdownRules,
+                showdownPoolMin,
                 // Game filters
                 teamSalaryMin,
                 teamSalaryMax,
@@ -3112,6 +3150,7 @@ export default function Optimizer() {
                 if (settings.stackTeam) setStackTeam(settings.stackTeam)
                 if (settings.legacyRules) setLegacyRules(settings.legacyRules)
                 if (settings.showdownRules) setShowdownRules(settings.showdownRules)
+                if (settings.showdownPoolMin !== undefined) setShowdownPoolMin(settings.showdownPoolMin)
 
                 // Restore game filter rules
                 if (settings.teamSalaryMin) setTeamSalaryMin(settings.teamSalaryMin)
@@ -3253,6 +3292,83 @@ export default function Optimizer() {
     }
     // ─── End Add Custom Player ────────────────────────────────────────────────
 
+    // ─── Lineup sorting/filtering ─────────────────────────────────────────────
+    // Reuses the existing `stackFilter` state (set from the "Stacks used"
+    // panel below the grid) instead of a second, separate stack-filter state —
+    // two independent stack filters acting on the same grid would silently
+    // disagree with each other about which lineups are shown.
+    //
+    // Each entry carries `validIndex` — the lineup's position in `valid`
+    // (below) — alongside the lineup itself, since sorting/filtering means
+    // a card's position in this array no longer matches its position in
+    // `lineups`. `validIndex` is what `selectedLineupIndices`/
+    // `toggleLineupSelection`/`sendToMyLineups` already key off of, so the
+    // checkbox/selection UI keeps working correctly after this reorders or
+    // hides cards; the plain map position is used only for the "#N" label.
+    const sortedFilteredLineups = (() => {
+        const valid = lineups.filter(l => l && l.some(p => p !== null))
+        const withIndex = valid.map((lu, validIndex) => ({ lu, validIndex }))
+
+        // Apply filters
+        let filtered = withIndex.filter(({ lu }) => {
+            // Stack filter
+            if (stackFilter) {
+                const detected = detectStackTeam(lu)
+                if (detected?.team !== stackFilter) return false
+            }
+
+            // Min projection filter
+            if (lineupMinProj) {
+                const proj = lu.reduce((sum, p) => sum + (p ? getProjection(p) : 0), 0)
+                if (proj < parseFloat(lineupMinProj)) return false
+            }
+
+            // Max salary filter
+            if (lineupMaxSalary) {
+                const salary = lu.reduce((sum, p) => sum + (p?.DisplaySalary || p?.OperatorSalary || 0), 0)
+                if (salary > parseInt(lineupMaxSalary)) return false
+            }
+
+            return true
+        })
+
+        // Apply sort
+        filtered.sort((a, b) => {
+            const getProjOf = (lu) => lu.reduce((sum, p) => sum + (p ? getProjection(p) : 0), 0)
+            const getSalOf = (lu) => lu.reduce((sum, p) => sum + (p?.DisplaySalary || p?.OperatorSalary || 0), 0)
+            const getAvgOwnOf = (lu) => {
+                const players = lu.filter(Boolean)
+                if (!players.length) return 0
+                return players.reduce((sum, p) => sum + (getOwnership(p) || 0), 0) / players.length
+            }
+
+            switch (lineupSortBy) {
+                case 'projected_desc':
+                    return getProjOf(b.lu) - getProjOf(a.lu)
+                case 'projected_asc':
+                    return getProjOf(a.lu) - getProjOf(b.lu)
+                case 'salary_desc':
+                    return getSalOf(b.lu) - getSalOf(a.lu)
+                case 'salary_asc':
+                    return getSalOf(a.lu) - getSalOf(b.lu)
+                case 'ownership_desc':
+                    return getAvgOwnOf(b.lu) - getAvgOwnOf(a.lu)
+                case 'ownership_asc':
+                    return getAvgOwnOf(a.lu) - getAvgOwnOf(b.lu)
+                case 'stack': {
+                    const stackA = detectStackTeam(a.lu)?.team || 'ZZZ'
+                    const stackB = detectStackTeam(b.lu)?.team || 'ZZZ'
+                    return stackA.localeCompare(stackB)
+                }
+                default:
+                    return 0
+            }
+        })
+
+        return filtered
+    })()
+    // ─── End lineup sorting/filtering ─────────────────────────────────────────
+
     return (
         <div className="min-h-screen" style={{ background: '#0A1628' }}>
 
@@ -3323,6 +3439,8 @@ export default function Optimizer() {
                             <button
                                 onClick={() => {
                                     setSlateType('showdown')
+                                    setGameFiltersTab('rules')
+                                    setShowdownRules(['both_teams_required'])
                                     setPlayers([])
                                     setLineups([new Array(6).fill(null)])
                                     setLineupCount(1)
@@ -5636,15 +5754,135 @@ export default function Optimizer() {
                                 </div>
                             )}
 
+                            {isMultiLineup && (
+                                <div className="mt-3 mb-3 flex items-center gap-3 flex-wrap p-3 rounded-xl border border-[#223366]"
+                                    style={{ background: '#132244' }}>
+
+                                    {/* Sort dropdown */}
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <span className="text-xs text-[#8A9BBE] shrink-0">Sort by:</span>
+                                        <select
+                                            value={lineupSortBy}
+                                            onChange={e => setLineupSortBy(e.target.value)}
+                                            className="px-2 py-1.5 rounded-lg text-xs outline-none border border-[#223366] text-white font-bold"
+                                            style={{ background: '#0A1628' }}>
+                                            <option value="projected_desc">Proj Pts ↓ (High to Low)</option>
+                                            <option value="projected_asc">Proj Pts ↑ (Low to High)</option>
+                                            <option value="salary_desc">Salary ↓ (Max to Min)</option>
+                                            <option value="salary_asc">Salary ↑ (Min to Max)</option>
+                                            <option value="ownership_desc">Avg Ownership ↓ (High to Low)</option>
+                                            <option value="ownership_asc">Avg Ownership ↑ (Low to High)</option>
+                                            <option value="stack">Stack Team (A-Z)</option>
+                                        </select>
+                                    </div>
+
+                                    <div className="w-px h-5 bg-[#223366] shrink-0" />
+
+                                    {/* Min projection filter */}
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <span className="text-xs text-[#8A9BBE] shrink-0">Min Pts:</span>
+                                        <input
+                                            type="number"
+                                            value={lineupMinProj}
+                                            onChange={e => setLineupMinProj(e.target.value)}
+                                            placeholder="e.g. 130"
+                                            step="5"
+                                            className="w-20 px-2 py-1.5 rounded-lg text-xs outline-none border border-[#223366] focus:border-[#FFB800] text-white"
+                                            style={{ background: '#0A1628' }}
+                                        />
+                                    </div>
+
+                                    {/* Max salary filter */}
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <span className="text-xs text-[#8A9BBE] shrink-0">Max Salary:</span>
+                                        <input
+                                            type="number"
+                                            value={lineupMaxSalary}
+                                            onChange={e => setLineupMaxSalary(e.target.value)}
+                                            placeholder="e.g. 49900"
+                                            step="100"
+                                            className="w-24 px-2 py-1.5 rounded-lg text-xs outline-none border border-[#223366] focus:border-[#FFB800] text-white"
+                                            style={{ background: '#0A1628' }}
+                                        />
+                                    </div>
+
+                                    <div className="w-px h-5 bg-[#223366] shrink-0" />
+
+                                    {/* Stack filter — reuses stackFilter/setStackFilter, the same
+                                        state the "Stacks used" panel below the grid drives, so the
+                                        two controls stay in sync instead of fighting each other. */}
+                                    {(() => {
+                                        const stackSummary = {}
+                                        lineups
+                                            .filter(l => l && l.some(p => p !== null))
+                                            .forEach(lu => {
+                                                const s = detectStackTeam(lu)
+                                                if (s) stackSummary[s.team] = (stackSummary[s.team] || 0) + 1
+                                            })
+                                        const teams = Object.keys(stackSummary)
+                                        if (teams.length <= 1) return null
+                                        return (
+                                            <div className="flex items-center gap-2 shrink-0">
+                                                <span className="text-xs text-[#8A9BBE] shrink-0">Stack:</span>
+                                                <div className="flex gap-1">
+                                                    <button
+                                                        onClick={() => setStackFilter(null)}
+                                                        className="px-2 py-1 rounded text-xs font-bold border transition-all"
+                                                        style={{
+                                                            background: !stackFilter ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                            borderColor: !stackFilter ? '#FFB800' : '#223366',
+                                                            color: !stackFilter ? '#FFB800' : '#8A9BBE'
+                                                        }}>
+                                                        All
+                                                    </button>
+                                                    {teams.map(team => (
+                                                        <button key={team}
+                                                            onClick={() => setStackFilter(stackFilter === team ? null : team)}
+                                                            className="px-2 py-1 rounded text-xs font-bold border transition-all"
+                                                            style={{
+                                                                background: stackFilter === team ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                                borderColor: stackFilter === team ? '#FFB800' : '#223366',
+                                                                color: stackFilter === team ? '#FFB800' : '#8A9BBE'
+                                                            }}>
+                                                            {team}
+                                                            <span className="ml-1 text-xs opacity-70">{stackSummary[team]}</span>
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )
+                                    })()}
+
+                                    <div className="ml-auto flex items-center gap-3">
+                                        {/* Results count */}
+                                        <div className="text-xs text-[#8A9BBE]">
+                                            <span className="text-[#FFB800] font-bold">{sortedFilteredLineups.length}</span>
+                                            {' '}of{' '}
+                                            <span className="font-bold text-white">
+                                                {lineups.filter(l => l && l.some(p => p !== null)).length}
+                                            </span>
+                                            {' '}lineups
+                                        </div>
+
+                                        {/* Clear filters */}
+                                        {(lineupMinProj || lineupMaxSalary || stackFilter) && (
+                                            <button
+                                                onClick={() => {
+                                                    setLineupMinProj('')
+                                                    setLineupMaxSalary('')
+                                                    setStackFilter(null)
+                                                }}
+                                                className="text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors font-bold">
+                                                ✕ Clear Filters
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
                             <div className="grid grid-cols-2 gap-4">
-                                {lineups
-                                    .filter(l => l && l.some(p => p !== null))
-                                    .filter(lu => {
-                                        if (!stackFilter) return true
-                                        const detected = detectStackTeam(lu)
-                                        return detected?.team === stackFilter
-                                    })
-                                    .map((lu, lineupIndex) => {
+                                {sortedFilteredLineups
+                                    .map(({ lu, validIndex }, lineupIndex) => {
                                         const totalSalary = lu.reduce((sum, p) => sum + (p?.OperatorSalary || 0), 0)
                                         const totalProj = lu.reduce((sum, p) => sum + (p ? getProjection(p) : 0), 0)
                                         const remaining = cap - totalSalary
@@ -5652,22 +5890,22 @@ export default function Optimizer() {
                                         const lineupStackTeam = detectedStack?.team || null
                                         const lineupStackCount = detectedStack?.count || 0
                                         return (
-                                            <div key={lineupIndex}
+                                            <div key={validIndex}
                                                 className="rounded-xl border border-[#223366] overflow-hidden transition-all hover:border-[#FFB800]"
                                                 style={{ background: '#0F1E38' }}>
                                                 <div className="flex items-center justify-between px-4 py-3 border-b border-[#223366] cursor-pointer"
                                                     style={{
-                                                        background: selectedLineupIndices.has(lineupIndex) ? 'rgba(99,102,241,0.1)' : '#1A2E55'
+                                                        background: selectedLineupIndices.has(validIndex) ? 'rgba(99,102,241,0.1)' : '#1A2E55'
                                                     }}
-                                                    onClick={() => toggleLineupSelection(lineupIndex)}>
+                                                    onClick={() => toggleLineupSelection(validIndex)}>
                                                     <div className="flex items-center gap-3">
                                                         {/* Checkbox */}
                                                         <div className="w-5 h-5 rounded border-2 flex items-center justify-center shrink-0 transition-all"
                                                             style={{
-                                                                borderColor: selectedLineupIndices.has(lineupIndex) ? '#818CF8' : '#223366',
-                                                                background: selectedLineupIndices.has(lineupIndex) ? '#818CF8' : 'transparent'
+                                                                borderColor: selectedLineupIndices.has(validIndex) ? '#818CF8' : '#223366',
+                                                                background: selectedLineupIndices.has(validIndex) ? '#818CF8' : 'transparent'
                                                             }}>
-                                                            {selectedLineupIndices.has(lineupIndex) && (
+                                                            {selectedLineupIndices.has(validIndex) && (
                                                                 <span className="text-white text-xs font-black">✓</span>
                                                             )}
                                                         </div>
@@ -5710,8 +5948,10 @@ export default function Optimizer() {
                                                         </div>
                                                         <button
                                                             onClick={() => {
-                                                                const updated = [...lineups]
-                                                                updated.splice(lineupIndex, 1)
+                                                                // Remove by reference, not index — sorting/filtering means
+                                                                // this card's position no longer matches its position in
+                                                                // `lineups`, so an index-based splice could delete the wrong one.
+                                                                const updated = lineups.filter(l => l !== lu)
                                                                 setLineups(updated.length > 0 ? updated : [new Array(slots.length).fill(null)])
                                                                 setLineupCount(prev => Math.max(1, prev - 1))
                                                             }}
@@ -5721,12 +5961,12 @@ export default function Optimizer() {
                                                     </div>
                                                 </div>
 
-                                                {lineupReasonings[lineupIndex] && (
+                                                {lineupReasonings[validIndex] && (
                                                     <div className="px-4 py-2 border-b border-[#223366]"
                                                         style={{background:'rgba(99,102,241,0.05)'}}>
                                                         <div className="text-xs text-[#8A9BBE] flex items-start gap-1">
                                                             <span className="text-[#818CF8] shrink-0">🤖</span>
-                                                            <span>{lineupReasonings[lineupIndex]}</span>
+                                                            <span>{lineupReasonings[validIndex]}</span>
                                                         </div>
                                                     </div>
                                                 )}
@@ -6239,11 +6479,18 @@ export default function Optimizer() {
                         {/* Tabs */}
                         <div className="flex border-b border-[#223366] shrink-0">
                             {[
-                                { id: 'stacks', label: '🔗 Stacks', badge: multiStackRules.length || null },
-                                { id: 'pitchers', label: '⚾ Pitchers', badge: pitcherPool.length || null },
-                                { id: 'common', label: '🎯 Common Pool', badge: commonPool.length || null },
-                                { id: 'rules', label: '⚙️ Rules' },
-                            ].map(tab => (
+                                // Exposure-by-team stacking doesn't apply to a single-game
+                                // showdown slate (only 2 teams, 6 total roster spots).
+                                { id: 'stacks', label: '🔗 Stacks', badge: multiStackRules.length || null, show: slateType === 'classic' },
+                                // The pitcher-pool tab's content (whitelist SP/RP, set max
+                                // exposure) is MLB-specific — there's no NFL equivalent
+                                // (e.g. a DST pool) built yet, so hide rather than mislabel it.
+                                { id: 'pitchers', label: '⚾ Pitchers', badge: pitcherPool.length || null, show: sport === 'mlb' },
+                                { id: 'common', label: '🎯 Common Pool', badge: commonPool.length || null, show: true },
+                                { id: 'rules', label: '⚙️ Rules', show: true },
+                            ]
+                                .filter(tab => tab.show)
+                                .map(tab => (
                                 <button key={tab.id} onClick={() => setGameFiltersTab(tab.id)}
                                     className="flex-1 py-3 text-xs font-bold border-b-2 transition-all relative"
                                     style={{
@@ -6465,20 +6712,62 @@ export default function Optimizer() {
                             {/* COMMON POOL TAB */}
                             {gameFiltersTab === 'common' && (
                                 <div className="space-y-3">
-                                    <div className="text-xs text-[#8A9BBE]">
-                                        Hitters eligible to appear across all stacks. Click 🎯 on any hitter in the player table. If empty, full hitter pool is used.
-                                    </div>
+                                    {slateType === 'showdown' ? (
+                                        <div className="p-3 rounded-xl border border-[#FFB800]"
+                                            style={{ background: 'rgba(255,184,0,0.05)' }}>
+                                            <div className="text-xs font-bold text-[#FFB800] mb-1">
+                                                🏈 Showdown Common Pool
+                                            </div>
+                                            <div className="text-xs text-[#8A9BBE] mb-3">
+                                                Select key players from this game. The optimizer will guarantee at least N of them appear in every lineup alongside CPT and other rules.
+                                            </div>
+
+                                            {/* Min players selector */}
+                                            <div className="flex items-center gap-3 mb-2">
+                                                <span className="text-xs font-bold text-white shrink-0">
+                                                    Min players from pool:
+                                                </span>
+                                                <div className="flex gap-1">
+                                                    {[1,2,3,4,5].map(n => (
+                                                        <button key={n}
+                                                            onClick={() => setShowdownPoolMin(n)}
+                                                            className="w-8 h-8 rounded-lg text-xs font-black border transition-all"
+                                                            style={{
+                                                                background: showdownPoolMin === n ? '#FFB800' : '#0A1628',
+                                                                borderColor: showdownPoolMin === n ? '#FFB800' : '#223366',
+                                                                color: showdownPoolMin === n ? '#0A1628' : '#8A9BBE'
+                                                            }}>
+                                                            {n}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                                <span className="text-xs text-[#8A9BBE]">per lineup</span>
+                                            </div>
+
+                                            {commonPool.length > 0 && (
+                                                <div className="text-xs text-[#8A9BBE]">
+                                                    {commonPool.length} players in pool · optimizer will use ≥{showdownPoolMin} in every lineup
+                                                </div>
+                                            )}
+                                        </div>
+                                    ) : (
+                                        <div className="text-xs text-[#8A9BBE]">
+                                            Hitters eligible to appear across all stacks. Click 🎯 on any hitter in the player table. If empty, full hitter pool is used.
+                                        </div>
+                                    )}
 
                                     {commonPool.length === 0 ? (
                                         <div className="text-center py-10 rounded-xl border border-dashed border-[#223366]">
                                             <div className="text-3xl mb-2">🎯</div>
-                                            <div className="text-sm font-bold text-white mb-1">No common pool set</div>
-                                            <div className="text-xs text-[#8A9BBE]">Click 🎯 on any hitter in the player table</div>
+                                            <div className="text-sm font-bold text-white mb-1">
+                                                No {slateType === 'showdown' ? 'showdown pool' : 'common pool'} set
+                                            </div>
+                                            <div className="text-xs text-[#8A9BBE]">Click 🎯 on any player row to add them</div>
                                         </div>
                                     ) : (
                                         <>
                                             <div className="flex items-center justify-between">
-                                                <div className="text-xs font-bold text-[#818CF8]">{commonPool.length} players in common pool</div>
+                                                <div className="text-xs font-bold text-[#818CF8]">{commonPool.length} players in {slateType === 'showdown' ? 'showdown pool' : 'common pool'}</div>
                                                 <button onClick={() => setCommonPool([])} className="text-xs text-[#EF4444] hover:underline">Clear All</button>
                                             </div>
                                             <div className="space-y-2">
@@ -6494,17 +6783,21 @@ export default function Optimizer() {
                                                             <button onClick={() => setCommonPool(prev => prev.filter(p => p.SlatePlayerID !== player.SlatePlayerID))}
                                                                 className="text-[#8A9BBE] hover:text-[#EF4444] text-xs shrink-0">✕</button>
                                                         </div>
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="text-xs text-[#8A9BBE]">Max exposure:</span>
-                                                            <input
-                                                                type="range" min="5" max="100" step="5"
-                                                                value={player.maxExposurePct || 50}
-                                                                onChange={e => setCommonPool(prev => prev.map(p => p.SlatePlayerID === player.SlatePlayerID ? { ...p, maxExposurePct: parseInt(e.target.value) } : p))}
-                                                                className="flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
-                                                                style={{ background: `linear-gradient(to right, #818CF8 0%, #818CF8 ${player.maxExposurePct || 50}%, #223366 ${player.maxExposurePct || 50}%, #223366 100%)` }}
-                                                            />
-                                                            <span className="text-xs font-bold text-[#818CF8] w-8 text-right">{player.maxExposurePct || 50}%</span>
-                                                        </div>
+                                                        {/* Per-player exposure caps don't apply to showdown — the pool-wide
+                                                            min-count selector above covers it instead. */}
+                                                        {slateType !== 'showdown' && (
+                                                            <div className="flex items-center gap-2">
+                                                                <span className="text-xs text-[#8A9BBE]">Max exposure:</span>
+                                                                <input
+                                                                    type="range" min="5" max="100" step="5"
+                                                                    value={player.maxExposurePct || 50}
+                                                                    onChange={e => setCommonPool(prev => prev.map(p => p.SlatePlayerID === player.SlatePlayerID ? { ...p, maxExposurePct: parseInt(e.target.value) } : p))}
+                                                                    className="flex-1 h-1.5 rounded-full appearance-none cursor-pointer"
+                                                                    style={{ background: `linear-gradient(to right, #818CF8 0%, #818CF8 ${player.maxExposurePct || 50}%, #223366 ${player.maxExposurePct || 50}%, #223366 100%)` }}
+                                                                />
+                                                                <span className="text-xs font-bold text-[#818CF8] w-8 text-right">{player.maxExposurePct || 50}%</span>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 ))}
                                             </div>
@@ -6648,7 +6941,7 @@ export default function Optimizer() {
                                             className="w-full px-3 py-2 rounded-lg text-sm outline-none border border-[#223366] text-white"
                                             style={{ background: '#0A1628' }}>
                                             {[1,2,3,4,5,6,7,8].map(n => (
-                                                <option key={n} value={n}>{n} unique player{n > 1 ? 's' : ''}{n === 1 ? ' (Default)' : ''}</option>
+                                                <option key={n} value={n}>{n} unique player{n > 1 ? 's' : ''}{n === 2 ? ' (Recommended)' : ''}</option>
                                             ))}
                                         </select>
                                     </div>
@@ -6681,91 +6974,119 @@ export default function Optimizer() {
                                         </div>
                                     </div>
 
-                                    <div className="pb-4 border-b border-[#223366]">
-                                        <div className="flex items-center gap-2 mb-2">
-                                            <div className="text-xs font-bold text-white">Hitters vs Pitcher</div>
-                                            <div className="w-4 h-4 rounded-full flex items-center justify-center text-xs"
-                                                style={{ background: 'rgba(138,155,190,0.2)', color: '#8A9BBE' }}
-                                                title="Max hitters batting against your pitcher">i</div>
-                                        </div>
-                                        <select value={hittersVsPitcher}
-                                            onChange={e => setHittersVsPitcher(Number(e.target.value))}
-                                            className="w-full px-3 py-2 rounded-lg text-sm outline-none border border-[#223366] text-white"
-                                            style={{ background: '#0A1628' }}>
-                                            <option value={0}>max 0 Hitters (Default)</option>
-                                            <option value={1}>max 1 Hitter</option>
-                                            <option value={2}>max 2 Hitters</option>
-                                            <option value={3}>max 3 Hitters</option>
-                                            <option value={4}>max 4 Hitters</option>
-                                        </select>
-                                    </div>
-
-                                    <div className="pb-4 border-b border-[#223366]">
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <div>
-                                                <div className="text-xs font-bold text-white mb-2">Max per Team</div>
-                                                <div className="flex gap-1 flex-wrap">
-                                                    {[3,4,5,6,7,8].map(n => (
-                                                        <button key={n} onClick={() => setPlayersPerTeamMax(n)}
-                                                            className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
-                                                            style={{
-                                                                background: playersPerTeamMax === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                                borderColor: playersPerTeamMax === n ? '#FFB800' : '#223366',
-                                                                color: playersPerTeamMax === n ? '#FFB800' : '#8A9BBE'
-                                                            }}>{n}</button>
-                                                    ))}
-                                                </div>
+                                    {/* Hitters vs Pitcher — MLB classic only */}
+                                    {sport === 'mlb' && slateType === 'classic' && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="flex items-center gap-2 mb-2">
+                                                <div className="text-xs font-bold text-white">Hitters vs Pitcher</div>
+                                                <div className="w-4 h-4 rounded-full flex items-center justify-center text-xs"
+                                                    style={{ background: 'rgba(138,155,190,0.2)', color: '#8A9BBE' }}
+                                                    title="Max hitters batting against your pitcher">i</div>
                                             </div>
-                                            <div>
-                                                <div className="text-xs font-bold text-white mb-2">Max per Game</div>
-                                                <div className="flex gap-1 flex-wrap">
-                                                    {[4,5,6,7,8].map(n => (
-                                                        <button key={n} onClick={() => setPlayersPerGameMax(n)}
-                                                            className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
-                                                            style={{
-                                                                background: playersPerGameMax === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                                borderColor: playersPerGameMax === n ? '#FFB800' : '#223366',
-                                                                color: playersPerGameMax === n ? '#FFB800' : '#8A9BBE'
-                                                            }}>{n}</button>
-                                                    ))}
-                                                </div>
+                                            <select value={hittersVsPitcher}
+                                                onChange={e => setHittersVsPitcher(Number(e.target.value))}
+                                                className="w-full px-3 py-2 rounded-lg text-sm outline-none border border-[#223366] text-white"
+                                                style={{ background: '#0A1628' }}>
+                                                <option value={0}>max 0 Hitters (Default)</option>
+                                                <option value={1}>max 1 Hitter</option>
+                                                <option value={2}>max 2 Hitters</option>
+                                                <option value={3}>max 3 Hitters</option>
+                                                <option value={4}>max 4 Hitters</option>
+                                            </select>
+                                        </div>
+                                    )}
+
+                                    {/* Max per Team — classic only (MLB and NFL) */}
+                                    {slateType === 'classic' && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="text-xs font-bold text-white mb-2">Max Players per Team</div>
+                                            <div className="flex gap-1 flex-wrap">
+                                                {(sport === 'mlb' ? [3,4,5,6,7,8] : [2,3,4,5,6,7]).map(n => (
+                                                    <button key={n} onClick={() => setPlayersPerTeamMax(n)}
+                                                        className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
+                                                        style={{
+                                                            background: playersPerTeamMax === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                            borderColor: playersPerTeamMax === n ? '#FFB800' : '#223366',
+                                                            color: playersPerTeamMax === n ? '#FFB800' : '#8A9BBE'
+                                                        }}>{n}</button>
+                                                ))}
                                             </div>
                                         </div>
-                                    </div>
+                                    )}
 
-                                    <div className="pb-4 border-b border-[#223366]">
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <div>
-                                                <div className="text-xs font-bold text-white mb-2">Min from same team</div>
-                                                <div className="flex gap-1">
-                                                    {[0,2,3,4].map(n => (
-                                                        <button key={n} onClick={() => setLegacyRules(prev => ({ ...prev, minFromSameTeam: n }))}
-                                                            className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
-                                                            style={{
-                                                                background: legacyRules.minFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                                borderColor: legacyRules.minFromSameTeam === n ? '#FFB800' : '#223366',
-                                                                color: legacyRules.minFromSameTeam === n ? '#FFB800' : '#8A9BBE'
-                                                            }}>{n}</button>
-                                                    ))}
-                                                </div>
+                                    {/* Max per Game — classic only (MLB and NFL) */}
+                                    {slateType === 'classic' && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="text-xs font-bold text-white mb-2">Max Players per Game</div>
+                                            <div className="flex gap-1 flex-wrap">
+                                                {[4,5,6,7,8].map(n => (
+                                                    <button key={n} onClick={() => setPlayersPerGameMax(n)}
+                                                        className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
+                                                        style={{
+                                                            background: playersPerGameMax === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                            borderColor: playersPerGameMax === n ? '#FFB800' : '#223366',
+                                                            color: playersPerGameMax === n ? '#FFB800' : '#8A9BBE'
+                                                        }}>{n}</button>
+                                                ))}
                                             </div>
-                                            <div>
-                                                <div className="text-xs font-bold text-white mb-2">Max from same team</div>
-                                                <div className="flex gap-1">
-                                                    {[3,4,5,6].map(n => (
-                                                        <button key={n} onClick={() => setLegacyRules(prev => ({ ...prev, maxFromSameTeam: n }))}
-                                                            className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
-                                                            style={{
-                                                                background: legacyRules.maxFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
-                                                                borderColor: legacyRules.maxFromSameTeam === n ? '#FFB800' : '#223366',
-                                                                color: legacyRules.maxFromSameTeam === n ? '#FFB800' : '#8A9BBE'
-                                                            }}>{n}</button>
-                                                    ))}
+                                        </div>
+                                    )}
+
+                                    {/* Min/Max from same team — MLB classic only */}
+                                    {sport === 'mlb' && slateType === 'classic' && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="grid grid-cols-2 gap-4">
+                                                <div>
+                                                    <div className="text-xs font-bold text-white mb-2">Min from same team</div>
+                                                    <div className="flex gap-1">
+                                                        {[0,2,3,4].map(n => (
+                                                            <button key={n} onClick={() => setLegacyRules(prev => ({ ...prev, minFromSameTeam: n }))}
+                                                                className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
+                                                                style={{
+                                                                    background: legacyRules.minFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                                    borderColor: legacyRules.minFromSameTeam === n ? '#FFB800' : '#223366',
+                                                                    color: legacyRules.minFromSameTeam === n ? '#FFB800' : '#8A9BBE'
+                                                                }}>{n}</button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-xs font-bold text-white mb-2">Max from same team</div>
+                                                    <div className="flex gap-1">
+                                                        {[3,4,5,6].map(n => (
+                                                            <button key={n} onClick={() => setLegacyRules(prev => ({ ...prev, maxFromSameTeam: n }))}
+                                                                className="px-2.5 py-1 rounded text-xs font-bold border transition-all"
+                                                                style={{
+                                                                    background: legacyRules.maxFromSameTeam === n ? 'rgba(255,184,0,0.1)' : '#0A1628',
+                                                                    borderColor: legacyRules.maxFromSameTeam === n ? '#FFB800' : '#223366',
+                                                                    color: legacyRules.maxFromSameTeam === n ? '#FFB800' : '#8A9BBE'
+                                                                }}>{n}</button>
+                                                        ))}
+                                                    </div>
                                                 </div>
                                             </div>
                                         </div>
-                                    </div>
+                                    )}
 
+                                    {/* Locked Players — all modes */}
+                                    {legacyRules.lockedPlayers.length > 0 && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="text-xs text-[#22C55E] font-bold mb-2">🔒 Locked Players</div>
+                                            <div className="flex flex-wrap gap-1">
+                                                {legacyRules.lockedPlayers.map(p => (
+                                                    <span key={p.SlatePlayerID}
+                                                        className="px-2 py-1 rounded text-xs font-semibold flex items-center gap-1"
+                                                        style={{ background: 'rgba(34,197,94,0.1)', color: '#22C55E', border: '1px solid rgba(34,197,94,0.3)' }}>
+                                                        {p.OperatorPlayerName}
+                                                        <button onClick={() => setLegacyRules(prev => ({ ...prev, lockedPlayers: prev.lockedPlayers.filter(lp => lp.SlatePlayerID !== p.SlatePlayerID) }))}
+                                                            className="hover:text-white ml-1">✕</button>
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Excluded Players — all modes */}
                                     {legacyRules.excludedPlayers.length > 0 && (
                                         <div className="pb-4 border-b border-[#223366]">
                                             <div className="text-xs text-[#EF4444] font-bold mb-2">✕ Excluded Players</div>
@@ -6785,15 +7106,18 @@ export default function Optimizer() {
 
                                     <button
                                         onClick={() => {
-                                            setLegacyRules(prev => ({ ...prev, minFromSameTeam: 0, maxFromSameTeam: 5, excludedPlayers: [] }))
-                                            setUniquePlayersPerLineup(1)
-                                            setTeamSalaryMin('49500')
-                                            setTeamSalaryMax('50000')
+                                            setLegacyRules({ minFromSameTeam: 0, maxFromSameTeam: 5, lockedPlayers: [], excludedPlayers: [] })
+                                            setUniquePlayersPerLineup(2)
+                                            setTeamSalaryMin(platform === 'fanduel' ? '59000' : '49500')
+                                            setTeamSalaryMax(platform === 'fanduel' ? '60000' : '50000')
                                             setHittersVsPitcher(0)
                                             setPlayersPerTeamMax(5)
                                             setPlayersPerGameMax(8)
+                                            if (slateType === 'showdown') {
+                                                setShowdownRules([])
+                                            }
                                         }}
-                                        className="text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors">
+                                        className="w-full text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors pt-2">
                                         ↺ Reset All Rules
                                     </button>
                                 </div>

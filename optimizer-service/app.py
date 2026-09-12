@@ -527,6 +527,31 @@ def optimize():
                         return slot_fail('RB')
                     model.Add(sum(vars_list[i] for i in rb_eligible) >= rb_count)
 
+                # DEFAULT: Always require exactly 2 RBs for NFL classic
+                # (fills RB + one FLEX with RB) — this used to be the
+                # optional "two_rb" rule; it's now baked in unconditionally
+                # so removing that rule from the selectable list doesn't
+                # silently change behavior for lineups that relied on it.
+                if is_nfl and not is_showdown:
+                    rb_pool_default = [
+                        i for i in range(n)
+                        if players[i].get('operatorPosition') == 'RB'
+                        or 'RB' in (players[i].get('operatorRosterSlots') or [])
+                    ]
+                    if len(rb_pool_default) >= 2:
+                        model.Add(
+                            sum(vars_list[i] for i in rb_pool_default) >= 2
+                        )
+                        print(f"Default NFL: 2 RBs required, "
+                              f"{len(rb_pool_default)} available")
+                    elif len(rb_pool_default) == 1:
+                        model.Add(
+                            sum(vars_list[i] for i in rb_pool_default) >= 1
+                        )
+                        print(f"Default NFL: only 1 RB available")
+                    else:
+                        print("WARNING: No RBs in pool")
+
                 if wr_count:
                     wr_eligible = [i for i in range(n) if player_fits_slot(players[i], 'WR')]
                     print(f"Slot WR: {len(wr_eligible)} eligible (need >= {wr_count})")
@@ -1363,40 +1388,222 @@ def optimize():
 
                 # ── RULE: qb_stack ───────────────────────────
                 # QB + 2 pass catchers from same team
-                if 'qb_stack' in nfl_classic_rules and current_stack:
-                    stack_qb = [
-                        i for i in qb_indices
-                        if players[i].get('team') == current_stack
-                    ]
-                    stack_pass_catchers = [
-                        i for i in range(n)
-                        if players[i].get('team') == current_stack
-                        and players[i].get('operatorPosition') in ['WR', 'TE']
-                    ]
-                    if stack_qb:
-                        model.Add(
-                            sum(vars_list[i] for i in stack_qb) >= 1
+                # Works whether or not a stack team is selected
+                if 'qb_stack' in nfl_classic_rules:
+                    print("Applying qb_stack rule...")
+
+                    # Get all teams that have both a QB and
+                    # at least 2 WR/TE in the pool
+                    eligible_stack_teams = []
+                    all_teams = list(set(
+                        p.get('team', '') for p in players
+                        if p.get('team')
+                    ))
+
+                    for team in all_teams:
+                        team_qbs = [
+                            i for i in qb_indices
+                            if players[i].get('team') == team
+                        ]
+                        team_pass_catchers = [
+                            i for i in range(n)
+                            if players[i].get('team') == team
+                            and players[i].get('operatorPosition') in ['WR', 'TE']
+                        ]
+                        if team_qbs and len(team_pass_catchers) >= 2:
+                            eligible_stack_teams.append({
+                                'team': team,
+                                'qbs': team_qbs,
+                                'catchers': team_pass_catchers
+                            })
+
+                    print(f"qb_stack: {len(eligible_stack_teams)} "
+                          f"teams eligible for QB stack")
+
+                    if current_stack:
+                        # Stack team is specified — enforce for that team
+                        stack_info = next(
+                            (t for t in eligible_stack_teams
+                             if t['team'] == current_stack),
+                            None
                         )
-                        print(f"qb_stack: QB from {current_stack}")
-                    if len(stack_pass_catchers) >= 2:
-                        model.Add(
-                            sum(vars_list[i] for i in stack_pass_catchers) >= 2
-                        )
-                        print(f"qb_stack: 2+ WR/TE from {current_stack}")
+                        if stack_info:
+                            # Must use QB from stack team
+                            model.Add(
+                                sum(vars_list[i] for i in stack_info['qbs']) >= 1
+                            )
+                            # Must use 2+ WR/TE from stack team
+                            model.Add(
+                                sum(vars_list[i] for i in stack_info['catchers']) >= 2
+                            )
+                            print(f"qb_stack: QB + 2 WR/TE from "
+                                  f"{current_stack} enforced")
+                        else:
+                            print(f"qb_stack: {current_stack} has no "
+                                  f"eligible QB stack — skipping")
+
+                    else:
+                        # No stack team — use a binary variable approach
+                        # Pick ONE team and enforce QB + 2 catchers
+                        # from that same team
+                        if len(eligible_stack_teams) >= 1:
+                            # Create binary var for each eligible team
+                            team_selected_vars = []
+                            for info in eligible_stack_teams:
+                                team_var = model.NewBoolVar(
+                                    f'qb_stack_team_{info["team"]}'
+                                )
+                                team_selected_vars.append(team_var)
+
+                                # If this team is selected as stack:
+                                # must use its QB
+                                model.Add(
+                                    sum(vars_list[i] for i in info['qbs']) >= 1
+                                ).OnlyEnforceIf(team_var)
+
+                                # must use 2+ of its WR/TE
+                                model.Add(
+                                    sum(vars_list[i] for i in info['catchers']) >= 2
+                                ).OnlyEnforceIf(team_var)
+
+                                # If NOT selected: their QB doesn't
+                                # need to be used with 2 catchers
+                                # (QB can still appear, just not forced)
+
+                            # Exactly one team must be the QB stack
+                            model.Add(
+                                sum(team_selected_vars) >= 1
+                            )
+
+                            print(f"qb_stack: enforcing QB + 2 WR/TE "
+                                  f"from one of {len(eligible_stack_teams)} "
+                                  f"eligible teams")
+                        else:
+                            print("qb_stack: no teams have QB + 2 WR/TE "
+                                  "available — skipping rule")
+
+                    print(f"qb_stack rule processing complete")
 
                 # ── RULE: bring_back ─────────────────────────
-                # 1 WR/TE/RB from opposing team
-                if 'bring_back' in nfl_classic_rules and opposing_team:
-                    opp_skill = [
-                        i for i in range(n)
-                        if players[i].get('team') == opposing_team
-                        and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
-                    ]
-                    if opp_skill:
-                        model.Add(
-                            sum(vars_list[i] for i in opp_skill) >= 1
-                        )
-                        print(f"bring_back: 1+ skill from {opposing_team}")
+                # 1 WR/TE/RB from opposing QB's team
+                # Works with or without explicit stack team
+                if 'bring_back' in nfl_classic_rules:
+                    print("Applying bring_back rule...")
+
+                    if current_stack and opposing_team:
+                        # Stack team known — bring back from opponent
+                        opp_skill = [
+                            i for i in range(n)
+                            if players[i].get('team') == opposing_team
+                            and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
+                        ]
+                        if opp_skill:
+                            model.Add(
+                                sum(vars_list[i] for i in opp_skill) >= 1
+                            )
+                            print(f"bring_back: >= 1 WR/TE/RB "
+                                  f"from {opposing_team} enforced")
+                        else:
+                            print(f"bring_back: no skill players "
+                                  f"from {opposing_team} — skipping")
+
+                    else:
+                        # No stack team selected — use game-based
+                        # bring-back logic.
+                        # For each game, if QB from team A is used,
+                        # require 1 skill player from team B
+                        # and vice versa.
+
+                        # Get all unique games in the pool
+                        game_ids = list(set(
+                            p.get('slateGameId', '')
+                            for p in players
+                            if p.get('slateGameId')
+                        ))
+
+                        print(f"bring_back: {len(game_ids)} games "
+                              f"found in pool")
+
+                        for game_id in game_ids:
+                            # Get both teams in this game
+                            game_players = [
+                                i for i in range(n)
+                                if players[i].get('slateGameId') == game_id
+                            ]
+                            if not game_players:
+                                continue
+
+                            game_teams = list(set(
+                                players[i].get('team', '')
+                                for i in game_players
+                                if players[i].get('team')
+                            ))
+
+                            if len(game_teams) != 2:
+                                continue
+
+                            team_a, team_b = game_teams[0], game_teams[1]
+
+                            # QBs per team
+                            qbs_a = [
+                                i for i in game_players
+                                if players[i].get('team') == team_a
+                                and players[i].get('operatorPosition') == 'QB'
+                            ]
+                            qbs_b = [
+                                i for i in game_players
+                                if players[i].get('team') == team_b
+                                and players[i].get('operatorPosition') == 'QB'
+                            ]
+
+                            # Skill players per team
+                            skill_a = [
+                                i for i in game_players
+                                if players[i].get('team') == team_a
+                                and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
+                            ]
+                            skill_b = [
+                                i for i in game_players
+                                if players[i].get('team') == team_b
+                                and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
+                            ]
+
+                            print(f"  Game {game_id}: "
+                                  f"{team_a}(QB:{len(qbs_a)},skill:{len(skill_a)}) "
+                                  f"vs {team_b}(QB:{len(qbs_b)},skill:{len(skill_b)})")
+
+                            # If QB from team A is used → need
+                            # skill from team B (and vice versa)
+                            if qbs_a and skill_b:
+                                qb_a_used = model.NewBoolVar(
+                                    f'qb_a_used_{game_id}_{team_a}'
+                                )
+                                model.Add(
+                                    sum(vars_list[i] for i in qbs_a) >= 1
+                                ).OnlyEnforceIf(qb_a_used)
+                                model.Add(
+                                    sum(vars_list[i] for i in qbs_a) == 0
+                                ).OnlyEnforceIf(qb_a_used.Not())
+                                model.Add(
+                                    sum(vars_list[i] for i in skill_b) >= 1
+                                ).OnlyEnforceIf(qb_a_used)
+
+                            if qbs_b and skill_a:
+                                qb_b_used = model.NewBoolVar(
+                                    f'qb_b_used_{game_id}_{team_b}'
+                                )
+                                model.Add(
+                                    sum(vars_list[i] for i in qbs_b) >= 1
+                                ).OnlyEnforceIf(qb_b_used)
+                                model.Add(
+                                    sum(vars_list[i] for i in qbs_b) == 0
+                                ).OnlyEnforceIf(qb_b_used.Not())
+                                model.Add(
+                                    sum(vars_list[i] for i in skill_a) >= 1
+                                ).OnlyEnforceIf(qb_b_used)
+
+                        print("bring_back: game-based correlation "
+                              "enforced across all games")
 
                 # ── RULE: no_dst_vs_stack ────────────────────
                 # Block DST that faces the stack team
@@ -1442,34 +1649,6 @@ def optimize():
                             blocked += 1
                     if blocked:
                         print(f"max_player_own: blocked {blocked} players over 35% own")
-
-                # ── RULE: must_have_rb ───────────────────────
-                # At least 1 RB in every lineup
-                if 'must_have_rb' in nfl_classic_rules:
-                    if rb_indices:
-                        model.Add(
-                            sum(vars_list[i] for i in rb_indices) >= 1
-                        )
-                        print(f"must_have_rb: >= 1 RB required")
-
-                # ── RULE: two_rb ─────────────────────────────
-                # At least 2 RBs in every lineup
-                if 'two_rb' in nfl_classic_rules:
-                    if len(rb_indices) >= 2:
-                        model.Add(
-                            sum(vars_list[i] for i in rb_indices) >= 2
-                        )
-                        print(f"two_rb: >= 2 RBs required")
-
-                # ── RULE: salary_floor ───────────────────────
-                # Must use at least $49,700
-                if 'salary_floor' in nfl_classic_rules:
-                    salary_expr = sum(
-                        vars_list[i] * int(players[i].get('operatorSalary', 0) or 0)
-                        for i in range(n)
-                    )
-                    model.Add(salary_expr >= 49700)
-                    print(f"salary_floor: >= $49,700 required")
 
             # Diversity constraint — look back at ALL previous lineups not
             # just 20, and enforce stronger uniqueness

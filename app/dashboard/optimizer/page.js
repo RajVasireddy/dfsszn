@@ -88,6 +88,7 @@ export default function Optimizer() {
     const [isFirstMount, setIsFirstMount] = useState(true)
     const [selectedLineupIndices, setSelectedLineupIndices] = useState(new Set())
     const [sentToMyLineups, setSentToMyLineups] = useState(false)
+    const [dedupMessage, setDedupMessage] = useState(null)
     const [stackFilter, setStackFilter] = useState(null)
     const [lineupSortBy, setLineupSortBy] = useState('projected_desc')
     const [lineupMinProj, setLineupMinProj] = useState('')
@@ -298,27 +299,6 @@ export default function Optimizer() {
             label: 'Cap Player Ownership at 35%',
             description: 'Exclude any player projected over 35% ownership',
             category: 'ownership',
-            param: null
-        },
-        {
-            id: 'must_have_rb',
-            label: 'Must Have at Least 1 RB',
-            description: 'Every lineup must include at least 1 RB (avoid RB-less builds)',
-            category: 'construction',
-            param: null
-        },
-        {
-            id: 'two_rb',
-            label: 'Run 2 RBs Every Lineup',
-            description: 'Use 2 RBs in every lineup (1 RB + 1 RB in FLEX)',
-            category: 'construction',
-            param: null
-        },
-        {
-            id: 'salary_floor',
-            label: 'Salary Floor $49,700+',
-            description: 'Every lineup must use at least $49,700 of the $50,000 cap',
-            category: 'construction',
             param: null
         },
     ]
@@ -2878,7 +2858,10 @@ export default function Optimizer() {
         slotList.forEach((slot, slotIndex) => {
             const eligible = luPlayers.filter(p => {
                 if (usedIds.has(p.slatePlayerId)) return false
-                const pos = p.operatorPosition || ''
+                // Uppercase-normalized so a lowercased/mixed-case position
+                // label from an odd data source still matches the (always
+                // uppercase) slot names below.
+                const pos = (p.operatorPosition || '').trim().toUpperCase()
                 const rs = p.operatorRosterSlots || []
                 // Showdown's CPT/FLEX slots are decided purely by which slot
                 // the optimizer assigned a player to (operatorRosterSlots),
@@ -2887,7 +2870,12 @@ export default function Optimizer() {
                 // check below would otherwise reject.
                 if (isShowdown) return rs.includes(slot)
                 if (slot === 'P') return pos === 'SP' || pos === 'RP' || pos === 'P' || rs.includes('P')
-                if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos) || pos.split('/').some(part => ['RB', 'WR', 'TE'].includes(part))
+                if (slot === 'K') return pos === 'K' || rs.includes('K')
+                // "D/ST" is a common alternate label for DST that doesn't
+                // split into "DST" via the "/" fallback below, so it needs
+                // its own check or a defense using that exact label never matches.
+                if (slot === 'DST' || slot === 'DEF') return ['DST', 'DEF', 'D/ST'].includes(pos) || rs.some(s => ['DST', 'DEF'].includes(s))
+                if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos) || pos.split('/').some(part => ['RB', 'WR', 'TE'].includes(part)) || rs.includes('FLEX')
                 if (pos.includes('/')) return pos.split('/').includes(slot)
                 if (rs.includes(slot)) return true
                 return pos === slot
@@ -2917,8 +2905,50 @@ export default function Optimizer() {
                     }
                 }
                 if (fullPlayer) { newLineup[slotIndex] = fullPlayer; usedIds.add(pick.slatePlayerId) }
+            } else {
+                console.warn(
+                    `No eligible player for slot ${slot} at index ${slotIndex}`,
+                    `Used IDs: ${usedIds.size}`,
+                    `Remaining players: ${luPlayers
+                        .filter(p => !usedIds.has(p.slatePlayerId))
+                        .map(p => p.operatorPlayerName)
+                        .join(', ')}`
+                )
             }
         })
+
+        // Second pass: fill any remaining empty slots with unplaced players
+        // (position-relaxed fallback). Classic-mode only — showdown's exact
+        // CPT/FLEX slot semantics don't have a "loosely fits" concept, and
+        // its own captainBaseId/name+team fallback above already covers id
+        // mismatches for that mode.
+        if (!isShowdown && newLineup.some(p => p === null)) {
+            const unplacedPlayers = luPlayers.filter(p => !usedIds.has(p.slatePlayerId))
+            slotList.forEach((slot, slotIndex) => {
+                if (newLineup[slotIndex]) return // already filled
+                if (unplacedPlayers.length === 0) return
+
+                console.warn(`Fallback fill for slot ${slot} at index ${slotIndex}`)
+
+                // Find any unplaced player that fits this slot loosely
+                const idx = unplacedPlayers.findIndex(p => {
+                    const pos = (p.operatorPosition || '').trim().toUpperCase()
+                    if (slot === 'FLEX') return ['RB', 'WR', 'TE'].includes(pos)
+                    if (slot === 'DST' || slot === 'DEF') return ['DST', 'DEF', 'D/ST'].includes(pos)
+                    return pos === slot
+                })
+
+                if (idx !== -1) {
+                    const pick = unplacedPlayers.splice(idx, 1)[0]
+                    const fullPlayer = pool.find(ep => ep.SlatePlayerID === pick.slatePlayerId)
+                    if (fullPlayer) {
+                        newLineup[slotIndex] = fullPlayer
+                        usedIds.add(pick.slatePlayerId)
+                    }
+                }
+            })
+        }
+
         return newLineup
     }
 
@@ -3262,7 +3292,19 @@ export default function Optimizer() {
                 if (settings.legacyRules) setLegacyRules(settings.legacyRules)
                 if (settings.showdownRules) setShowdownRules(settings.showdownRules)
                 if (settings.showdownPoolMin !== undefined) setShowdownPoolMin(settings.showdownPoolMin)
-                if (settings.nflClassicRules) setNflClassicRules(settings.nflClassicRules)
+                if (settings.nflClassicRules) {
+                    // Silently drop any ids from a previously-exported file
+                    // that no longer exist as selectable rules (e.g. the
+                    // removed construction rules) instead of restoring dead
+                    // ids that toggleNflClassicRule/the UI no longer know about.
+                    const validRuleIds = [
+                        'qb_stack', 'bring_back', 'no_dst_vs_stack',
+                        'min_one_low_own', 'max_player_own'
+                    ]
+                    setNflClassicRules(
+                        settings.nflClassicRules.filter(r => validRuleIds.includes(r))
+                    )
+                }
 
                 // Restore game filter rules
                 if (settings.teamSalaryMin) setTeamSalaryMin(settings.teamSalaryMin)
@@ -3480,6 +3522,37 @@ export default function Optimizer() {
         return filtered
     })()
     // ─── End lineup sorting/filtering ─────────────────────────────────────────
+
+    const deduplicateLineups = () => {
+        const valid = lineups.filter(l => l && l.some(p => p !== null))
+
+        const seenKeys = new Set()
+        const deduped = valid.filter(lu => {
+            const key = lu
+                .filter(Boolean)
+                .map(p => p.SlatePlayerID)
+                .sort((a, b) => a - b)
+                .join('-')
+            if (seenKeys.has(key)) return false
+            seenKeys.add(key)
+            return true
+        })
+
+        const removed = valid.length - deduped.length
+        setLineups(deduped)
+        setLineupCount(deduped.length)
+
+        // A dedicated message state, not setError — `error` only renders
+        // inside the player-pool table's empty-state slot, which would hide
+        // the entire player pool for 4 seconds instead of showing a
+        // confirmation near the Deduplicate button that triggered this.
+        if (removed > 0) {
+            setDedupMessage(`Removed ${removed} duplicate lineup${removed > 1 ? 's' : ''}. ${deduped.length} unique lineups remain.`)
+        } else {
+            setDedupMessage('No duplicates found — all lineups are unique.')
+        }
+        setTimeout(() => setDedupMessage(null), 4000)
+    }
 
     return (
         <div className="min-h-screen" style={{ background: '#0A1628' }}>
@@ -5020,6 +5093,19 @@ export default function Optimizer() {
                         ))}
                     </div>
 
+                    {playerTab === 'excluded' && legacyRules.excludedPlayers.length > 0 && (
+                        <div className="flex items-center justify-between mb-2 px-1">
+                            <span className="text-xs text-[#8A9BBE]">
+                                {legacyRules.excludedPlayers.length} excluded
+                            </span>
+                            <button
+                                onClick={() => setLegacyRules(prev => ({ ...prev, excludedPlayers: [] }))}
+                                className="text-xs font-bold text-[#EF4444] hover:underline transition-colors">
+                                ✕ Clear All Exclusions
+                            </button>
+                        </div>
+                    )}
+
                     {/* Position Filters */}
                     <div className="flex gap-2 mb-4 flex-wrap items-center">
                         {positionTabs.map(pos => (
@@ -5098,6 +5184,61 @@ export default function Optimizer() {
                                 </span>
                             )}
                         </button>
+                        {(() => {
+                            // Context-aware: only ever act on whatever passes the
+                            // current position filter + search (filteredPlayers) —
+                            // Exclude All never touches players scrolled out of view
+                            // by a filter, and Include All only un-excludes what's
+                            // currently visible (e.g. the EXCLUDED tab's own filtered list).
+                            const toExclude = filteredPlayers.filter(p =>
+                                !legacyRules.excludedPlayers.find(ep => ep.SlatePlayerID === p.SlatePlayerID)
+                            )
+                            const toInclude = legacyRules.excludedPlayers.filter(ep =>
+                                filteredPlayers.find(p => p.SlatePlayerID === ep.SlatePlayerID)
+                            )
+                            return (
+                                <div className="flex items-center gap-1.5 ml-2">
+                                    <button
+                                        onClick={() => {
+                                            if (toExclude.length === 0) return
+                                            setLegacyRules(prev => ({
+                                                ...prev,
+                                                excludedPlayers: [...prev.excludedPlayers, ...toExclude]
+                                            }))
+                                        }}
+                                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                                        style={{
+                                            background: 'rgba(239,68,68,0.08)',
+                                            borderColor: 'rgba(239,68,68,0.3)',
+                                            color: '#EF4444',
+                                            opacity: toExclude.length === 0 ? 0.4 : 1
+                                        }}
+                                        title="Exclude all players currently shown">
+                                        ✕ Exclude {posFilter !== 'ALL' ? posFilter : 'All'} ({toExclude.length})
+                                    </button>
+
+                                    <button
+                                        onClick={() => {
+                                            if (toInclude.length === 0) return
+                                            const visibleIds = new Set(filteredPlayers.map(p => p.SlatePlayerID))
+                                            setLegacyRules(prev => ({
+                                                ...prev,
+                                                excludedPlayers: prev.excludedPlayers.filter(ep => !visibleIds.has(ep.SlatePlayerID))
+                                            }))
+                                        }}
+                                        className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                                        style={{
+                                            background: 'rgba(34,197,94,0.08)',
+                                            borderColor: 'rgba(34,197,94,0.3)',
+                                            color: '#22C55E',
+                                            opacity: toInclude.length === 0 ? 0.4 : 1
+                                        }}
+                                        title="Remove all currently shown players from excluded list">
+                                        ✓ Include {posFilter !== 'ALL' ? posFilter : 'All'} ({toInclude.length})
+                                    </button>
+                                </div>
+                            )
+                        })()}
                     </div>
 
                     {showAddPlayer && (
@@ -5736,10 +5877,25 @@ export default function Optimizer() {
                                     </div>
                                 </div>
                                 <div className="flex items-center gap-2">
+                                    {dedupMessage && (
+                                        <div className="text-xs font-bold text-[#818CF8]">
+                                            {dedupMessage}
+                                        </div>
+                                    )}
                                     <button onClick={exportAllCSV}
                                         className="px-4 py-2 rounded-lg text-xs font-bold transition-all border"
                                         style={{ background: 'rgba(255,184,0,0.1)', borderColor: '#FFB800', color: '#FFB800' }}>
                                         ↓ Export All CSV
+                                    </button>
+                                    <button
+                                        onClick={deduplicateLineups}
+                                        className="px-4 py-2 rounded-lg text-xs font-bold transition-all border"
+                                        style={{
+                                            background: 'rgba(99,102,241,0.08)',
+                                            borderColor: '#818CF8',
+                                            color: '#818CF8'
+                                        }}>
+                                        ⧉ Deduplicate
                                     </button>
                                     <button
                                         onClick={() => dkEntries.length > 0 ? exportDKEntriesCSV() : setShowDKUpload(true)}
@@ -7067,7 +7223,7 @@ export default function Optimizer() {
                                                 </div>
                                             </div>
 
-                                            {['stack', 'ownership', 'construction'].map(cat => (
+                                            {['stack', 'ownership'].map(cat => (
                                                 <div key={cat} className="mb-4">
                                                     <div className="text-xs font-bold uppercase tracking-wider mb-2"
                                                         style={{
@@ -7076,8 +7232,7 @@ export default function Optimizer() {
                                                                     : '#22C55E'
                                                         }}>
                                                         {cat === 'stack' ? '🔗 Stack & Correlation'
-                                                            : cat === 'ownership' ? '📊 Ownership & Leverage'
-                                                                : '🏗 Construction'}
+                                                            : '📊 Ownership & Leverage'}
                                                     </div>
                                                     <div className="space-y-2">
                                                         {NFL_CLASSIC_RULES

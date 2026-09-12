@@ -59,8 +59,14 @@ def optimize():
         slots = body.get('slots', [])
         is_showdown = body.get('isShowdown', False)
         nfl_classic_rules = set(body.get('nflClassicRules', []))
-        if nfl_classic_rules:
-            print(f"NFL Classic rules: {nfl_classic_rules}")
+        print(f"=== NFL CLASSIC RULES RECEIVED ===")
+        print(f"Raw value: {body.get('nflClassicRules')}")
+        print(f"Parsed set: {nfl_classic_rules}")
+        print(f"is_showdown: {is_showdown}")
+        # is_nfl isn't known yet at this point in the request (it's derived
+        # from the player pool's positions further down) — logged separately
+        # right after it's actually computed, below.
+        print(f"=================================")
 
         # DEBUG logging
         print(f"\n{'='*50}")
@@ -241,6 +247,10 @@ def optimize():
             is_nfl = False
             is_mlb = False
             print("Mode: NFL Showdown")
+
+        print(f"is_nfl: {is_nfl}")
+        print(f"Will run rules: "
+              f"{is_nfl and not is_showdown and bool(nfl_classic_rules)}")
 
         stack_min_size = 3 if is_nfl else 5  # NFL: QB + 2 pass catchers minimum
 
@@ -815,9 +825,8 @@ def optimize():
                             ).OnlyEnforceIf(team_var.Not())
                         print("Rule stack_same_team: min 3 from one team")
 
-                # ── RULE: both_teams / both_teams_required ───────
-                if 'both_teams' in showdown_rules or \
-                   'both_teams_required' in showdown_rules:
+                # ── RULE: both_teams_required ────────────────────
+                if 'both_teams_required' in showdown_rules:
                     teams_in_pool = list(set(
                         p.get('team', '') for p in players
                         if p.get('team')
@@ -1006,6 +1015,9 @@ def optimize():
                     )
                     objective_terms.append(vars_list[i] * adjusted)
 
+                print(f"Model built — solving with "
+                      f"{len(nfl_classic_rules)} NFL classic rules "
+                      f"and {len(showdown_rules)} showdown rules")
                 model.Maximize(sum(objective_terms))
 
                 # Diversity for showdown — look back at ALL previous lineups
@@ -1023,6 +1035,7 @@ def optimize():
 
                 # Solve
                 status = solver_obj.Solve(model)
+                print(f"Solve status: {solver_obj.StatusName(status)}")
 
                 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     selected = [
@@ -1485,125 +1498,193 @@ def optimize():
                     print(f"qb_stack rule processing complete")
 
                 # ── RULE: bring_back ─────────────────────────
-                # 1 WR/TE/RB from opposing QB's team
-                # Works with or without explicit stack team
                 if 'bring_back' in nfl_classic_rules:
-                    print("Applying bring_back rule...")
+                    print("\n=== BRING BACK RULE DEBUG ===")
+                    print(f"current_stack: {current_stack}")
+                    print(f"opposing_team: {opposing_team}")
+                    print(f"Total players: {n}")
+
+                    # Show all teams in pool
+                    all_teams_in_pool = list(set(
+                        p.get('team', '') for p in players
+                        if p.get('team')
+                    ))
+                    print(f"Teams in pool: {all_teams_in_pool}")
+
+                    # Show all game IDs
+                    all_game_ids = list(set(
+                        p.get('slateGameId', '') for p in players
+                        if p.get('slateGameId')
+                    ))
+                    print(f"Game IDs in pool: {all_game_ids}")
+
+                    # Show all QBs
+                    qb_list = [
+                        (players[i].get('operatorPlayerName'),
+                         players[i].get('team'),
+                         players[i].get('slateGameId'))
+                        for i in range(n)
+                        if players[i].get('operatorPosition') == 'QB'
+                    ]
+                    print(f"QBs in pool: {qb_list}")
 
                     if current_stack and opposing_team:
-                        # Stack team known — bring back from opponent
+                        print(f"Mode: Stack-based bring-back")
                         opp_skill = [
                             i for i in range(n)
                             if players[i].get('team') == opposing_team
                             and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
                         ]
+                        print(f"Opposing skill players ({opposing_team}): "
+                              f"{len(opp_skill)}")
+                        for i in opp_skill[:5]:
+                            print(f"  {players[i].get('operatorPlayerName')} "
+                                  f"({players[i].get('operatorPosition')})")
+
                         if opp_skill:
                             model.Add(
                                 sum(vars_list[i] for i in opp_skill) >= 1
                             )
-                            print(f"bring_back: >= 1 WR/TE/RB "
-                                  f"from {opposing_team} enforced")
+                            print(f"✓ bring_back constraint added: "
+                                  f">= 1 from {opposing_team}")
                         else:
-                            print(f"bring_back: no skill players "
-                                  f"from {opposing_team} — skipping")
+                            print(f"✗ No skill players from "
+                                  f"{opposing_team} found in pool!")
 
                     else:
-                        # No stack team selected — use game-based
-                        # bring-back logic.
-                        # For each game, if QB from team A is used,
-                        # require 1 skill player from team B
-                        # and vice versa.
+                        print(f"Mode: Game-based bring-back "
+                              f"(no explicit stack)")
 
-                        # Get all unique games in the pool
                         game_ids = list(set(
                             p.get('slateGameId', '')
                             for p in players
                             if p.get('slateGameId')
                         ))
 
-                        print(f"bring_back: {len(game_ids)} games "
-                              f"found in pool")
-
+                        constraints_added = 0
                         for game_id in game_ids:
-                            # Get both teams in this game
-                            game_players = [
+                            if not game_id:
+                                continue
+
+                            game_player_indices = [
                                 i for i in range(n)
-                                if players[i].get('slateGameId') == game_id
+                                if str(players[i].get('slateGameId', ''))
+                                   == str(game_id)
                             ]
-                            if not game_players:
+
+                            if not game_player_indices:
                                 continue
 
                             game_teams = list(set(
                                 players[i].get('team', '')
-                                for i in game_players
+                                for i in game_player_indices
                                 if players[i].get('team')
                             ))
 
+                            print(f"\n  Game {game_id}: teams={game_teams}")
+
                             if len(game_teams) != 2:
+                                print(f"  Skipping — found {len(game_teams)} "
+                                      f"teams (need exactly 2)")
                                 continue
 
                             team_a, team_b = game_teams[0], game_teams[1]
 
-                            # QBs per team
                             qbs_a = [
-                                i for i in game_players
+                                i for i in game_player_indices
                                 if players[i].get('team') == team_a
                                 and players[i].get('operatorPosition') == 'QB'
                             ]
                             qbs_b = [
-                                i for i in game_players
+                                i for i in game_player_indices
                                 if players[i].get('team') == team_b
                                 and players[i].get('operatorPosition') == 'QB'
                             ]
-
-                            # Skill players per team
                             skill_a = [
-                                i for i in game_players
+                                i for i in game_player_indices
                                 if players[i].get('team') == team_a
                                 and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
                             ]
                             skill_b = [
-                                i for i in game_players
+                                i for i in game_player_indices
                                 if players[i].get('team') == team_b
                                 and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
                             ]
 
-                            print(f"  Game {game_id}: "
-                                  f"{team_a}(QB:{len(qbs_a)},skill:{len(skill_a)}) "
-                                  f"vs {team_b}(QB:{len(qbs_b)},skill:{len(skill_b)})")
+                            print(f"  {team_a}: {len(qbs_a)} QBs, "
+                                  f"{len(skill_a)} skill")
+                            print(f"  {team_b}: {len(qbs_b)} QBs, "
+                                  f"{len(skill_b)} skill")
 
-                            # If QB from team A is used → need
-                            # skill from team B (and vice versa)
+                            # Add conditional constraints
                             if qbs_a and skill_b:
-                                qb_a_used = model.NewBoolVar(
-                                    f'qb_a_used_{game_id}_{team_a}'
+                                qb_a_var = model.NewBoolVar(
+                                    f'bb_qb_{team_a}_{str(game_id)[:8]}'
                                 )
                                 model.Add(
                                     sum(vars_list[i] for i in qbs_a) >= 1
-                                ).OnlyEnforceIf(qb_a_used)
+                                ).OnlyEnforceIf(qb_a_var)
                                 model.Add(
                                     sum(vars_list[i] for i in qbs_a) == 0
-                                ).OnlyEnforceIf(qb_a_used.Not())
+                                ).OnlyEnforceIf(qb_a_var.Not())
                                 model.Add(
                                     sum(vars_list[i] for i in skill_b) >= 1
-                                ).OnlyEnforceIf(qb_a_used)
+                                ).OnlyEnforceIf(qb_a_var)
+                                constraints_added += 1
+                                print(f"  ✓ If {team_a} QB used "
+                                      f"→ need {team_b} skill")
 
                             if qbs_b and skill_a:
-                                qb_b_used = model.NewBoolVar(
-                                    f'qb_b_used_{game_id}_{team_b}'
+                                qb_b_var = model.NewBoolVar(
+                                    f'bb_qb_{team_b}_{str(game_id)[:8]}'
                                 )
                                 model.Add(
                                     sum(vars_list[i] for i in qbs_b) >= 1
-                                ).OnlyEnforceIf(qb_b_used)
+                                ).OnlyEnforceIf(qb_b_var)
                                 model.Add(
                                     sum(vars_list[i] for i in qbs_b) == 0
-                                ).OnlyEnforceIf(qb_b_used.Not())
+                                ).OnlyEnforceIf(qb_b_var.Not())
                                 model.Add(
                                     sum(vars_list[i] for i in skill_a) >= 1
-                                ).OnlyEnforceIf(qb_b_used)
+                                ).OnlyEnforceIf(qb_b_var)
+                                constraints_added += 1
+                                print(f"  ✓ If {team_b} QB used "
+                                      f"→ need {team_a} skill")
 
-                        print("bring_back: game-based correlation "
-                              "enforced across all games")
+                        print(f"\nbring_back: {constraints_added} "
+                              f"conditional constraints added")
+
+                        if constraints_added == 0:
+                            print("✗ WARNING: No bring_back constraints "
+                                  "were added! Check:")
+                            print("  - Do players have slateGameId set?")
+                            print("  - Are there QBs in the pool?")
+                            print("  - Are game IDs consistent?")
+
+                    print("=== END BRING BACK DEBUG ===\n")
+
+                # ── RULE: no_te_flex ─────────────────────────
+                # TE cannot play in FLEX slot
+                if 'no_te_flex' in nfl_classic_rules:
+                    te_indices_all = [
+                        i for i in range(n)
+                        if players[i].get('operatorPosition') == 'TE'
+                    ]
+                    te_slot_count = slots.count('TE')
+
+                    if te_indices_all:
+                        # Total TEs selected must equal
+                        # number of TE-specific slots only
+                        # This prevents TEs from taking FLEX
+                        model.Add(
+                            sum(vars_list[i] for i in te_indices_all)
+                            == te_slot_count
+                        )
+                        print(f"no_te_flex: max {te_slot_count} TE(s) "
+                              f"allowed ({len(te_indices_all)} in pool) "
+                              f"— FLEX must be RB or WR")
+                    else:
+                        print("no_te_flex: no TEs in pool")
 
                 # ── RULE: no_dst_vs_stack ────────────────────
                 # Block DST that faces the stack team
@@ -1704,6 +1785,11 @@ def optimize():
                     1
                 )
                 objective_terms.append(vars_list[i] * adjusted_score)
+            # showdown_rules isn't defined in this branch (it's only set
+            # inside the is_showdown branch above) — nfl_classic_rules is
+            # the one that's actually relevant, and always in scope, here.
+            print(f"Model built — solving with "
+                  f"{len(nfl_classic_rules)} NFL classic rules")
             model.Maximize(sum(objective_terms))
 
             # Pre-solve feasibility check
@@ -1813,6 +1899,7 @@ def optimize():
             print(f"--- End diagnostics ---\n")
 
             status = solver_obj.Solve(model)
+            print(f"Solve status: {solver_obj.StatusName(status)}")
 
             if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 selected_indices = [i for i in range(n) if solver_obj.Value(vars_list[i])]

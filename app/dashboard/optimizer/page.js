@@ -217,12 +217,6 @@ export default function Optimizer() {
             category: 'construction'
         },
         {
-            id: 'both_teams',
-            label: 'Players From Both Teams',
-            description: 'Must have at least 1 player from each team',
-            category: 'construction'
-        },
-        {
             id: 'both_teams_required',
             label: 'Players From Both Teams (Default)',
             description: 'Every lineup must have at least 1 player from each team in the game',
@@ -300,6 +294,12 @@ export default function Optimizer() {
             description: 'Exclude any player projected over 35% ownership',
             category: 'ownership',
             param: null
+        },
+        {
+            id: 'no_te_flex',
+            label: 'No TE in FLEX Slot',
+            description: 'TE can only fill the TE slot — not FLEX. Forces RB or WR in FLEX.',
+            category: 'construction',
         },
     ]
 
@@ -1324,6 +1324,12 @@ export default function Optimizer() {
                 stackTeamSize: stackTeam ? 5 : 0,
                 players: eligiblePool.length,
                 fillPool: fillPool.length
+            })
+            console.log('Optimizer request:', {
+                sport,
+                slateType,
+                nflClassicRules,
+                slots,
             })
             const res = await fetch('/api/optimize', {
                 method: 'POST',
@@ -3299,7 +3305,7 @@ export default function Optimizer() {
                     // ids that toggleNflClassicRule/the UI no longer know about.
                     const validRuleIds = [
                         'qb_stack', 'bring_back', 'no_dst_vs_stack',
-                        'min_one_low_own', 'max_player_own'
+                        'min_one_low_own', 'max_player_own', 'no_te_flex'
                     ]
                     setNflClassicRules(
                         settings.nflClassicRules.filter(r => validRuleIds.includes(r))
@@ -7223,7 +7229,7 @@ export default function Optimizer() {
                                                 </div>
                                             </div>
 
-                                            {['stack', 'ownership'].map(cat => (
+                                            {['stack', 'ownership', 'construction'].map(cat => (
                                                 <div key={cat} className="mb-4">
                                                     <div className="text-xs font-bold uppercase tracking-wider mb-2"
                                                         style={{
@@ -7232,7 +7238,8 @@ export default function Optimizer() {
                                                                     : '#22C55E'
                                                         }}>
                                                         {cat === 'stack' ? '🔗 Stack & Correlation'
-                                                            : '📊 Ownership & Leverage'}
+                                                            : cat === 'ownership' ? '📊 Ownership & Leverage'
+                                                                : '🏗 Construction'}
                                                     </div>
                                                     <div className="space-y-2">
                                                         {NFL_CLASSIC_RULES

@@ -7,6 +7,7 @@ export default function Optimizer() {
     const [platform, setPlatform] = useState('draftkings')
     const [slateType, setSlateType] = useState('classic') // 'classic' or 'showdown' — NFL DK only
     const [showdownRules, setShowdownRules] = useState(['both_teams_required']) // array of active SHOWDOWN_RULES ids
+    const [nflClassicRules, setNflClassicRules] = useState([]) // array of active NFL_CLASSIC_RULES ids
     const [slates, setSlates] = useState([])
     const [selectedSlate, setSelectedSlate] = useState(null)
     const [players, setPlayers] = useState([])
@@ -261,6 +262,75 @@ export default function Optimizer() {
         )
     }
 
+    // Optional constraints a user can toggle on for a classic NFL slate —
+    // mirrors SHOWDOWN_RULES above but for the 9-man classic roster.
+    const NFL_CLASSIC_RULES = [
+        {
+            id: 'qb_stack',
+            label: 'QB Stack (QB + 2 Pass Catchers)',
+            description: 'Stack team must include QB + at least 2 WR/TE from same team',
+            category: 'stack',
+            param: null
+        },
+        {
+            id: 'bring_back',
+            label: 'Bring-Back Correlation',
+            description: 'Include 1 WR/TE/RB from the opposing QB\'s team to correlate with the game',
+            category: 'stack',
+            param: null
+        },
+        {
+            id: 'no_dst_vs_stack',
+            label: 'No DST Against Stack Team',
+            description: 'DST cannot be from a team facing your primary stack',
+            category: 'stack',
+            param: null
+        },
+        {
+            id: 'min_one_low_own',
+            label: 'Min 1 Low-Owned Player (Under 15%)',
+            description: 'Every lineup must have at least 1 player projected under 15% ownership',
+            category: 'ownership',
+            param: null
+        },
+        {
+            id: 'max_player_own',
+            label: 'Cap Player Ownership at 35%',
+            description: 'Exclude any player projected over 35% ownership',
+            category: 'ownership',
+            param: null
+        },
+        {
+            id: 'must_have_rb',
+            label: 'Must Have at Least 1 RB',
+            description: 'Every lineup must include at least 1 RB (avoid RB-less builds)',
+            category: 'construction',
+            param: null
+        },
+        {
+            id: 'two_rb',
+            label: 'Run 2 RBs Every Lineup',
+            description: 'Use 2 RBs in every lineup (1 RB + 1 RB in FLEX)',
+            category: 'construction',
+            param: null
+        },
+        {
+            id: 'salary_floor',
+            label: 'Salary Floor $49,700+',
+            description: 'Every lineup must use at least $49,700 of the $50,000 cap',
+            category: 'construction',
+            param: null
+        },
+    ]
+
+    const toggleNflClassicRule = (ruleId) => {
+        setNflClassicRules(prev =>
+            prev.includes(ruleId)
+                ? prev.filter(r => r !== ruleId)
+                : [...prev, ruleId]
+        )
+    }
+
     const lineup = lineups[activeLineup] || new Array(slots.length).fill(null)
     const setLineup = (newLineup) => {
         const updated = [...lineups]
@@ -479,6 +549,7 @@ export default function Optimizer() {
         setSport(newSport)
         setSlateType('classic')
         setShowdownRules([])
+        setNflClassicRules([])
         setPlayers([])
         setManualPlayers([])
         setManualSlateInfo(null)
@@ -1309,6 +1380,7 @@ export default function Optimizer() {
                     slateType,
                     isShowdown,
                     showdownRules: slateType === 'showdown' ? showdownRules : [],
+                    nflClassicRules: sport === 'nfl' && slateType === 'classic' ? nflClassicRules : [],
                     minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                     maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                     numLineups: lineupCount,
@@ -1394,18 +1466,34 @@ export default function Optimizer() {
                 slots
             ))
 
-            const paddedLineups = Array.from(
-                { length: lineupCount },
-                (_, i) => properLineups[i] || new Array(slots.length).fill(null)
-            )
+            // Dedup lineups client-side by player ID set — the optimizer's
+            // own diversity constraints already try to prevent this, but a
+            // client-side backstop catches anything that slips through.
+            const seenKeys = new Set()
+            const dedupedLineups = properLineups.filter(lu => {
+                if (!lu || !lu.some(p => p !== null)) return false
+                const key = lu
+                    .filter(Boolean)
+                    .map(p => p.SlatePlayerID)
+                    .sort()
+                    .join('-')
+                if (seenKeys.has(key)) {
+                    console.log('Client dedup: removed duplicate lineup')
+                    return false
+                }
+                seenKeys.add(key)
+                return true
+            })
 
-            setLineups(paddedLineups)
+            console.log(`Generated: ${properLineups.length} → After dedup: ${dedupedLineups.length}`)
+
+            setLineups(dedupedLineups)
             setLineupSortBy('projected_desc')
             setLineupMinProj('')
             setLineupMaxSalary('')
             setStackFilter(null)
             setActiveLineup(0)
-            setLineupCount(data.generated)
+            setLineupCount(dedupedLineups.length)
 
         } catch (err) {
             console.error('Optimizer error:', err)
@@ -2138,6 +2226,7 @@ export default function Optimizer() {
                 slateType,
                 isShowdown,
                 showdownRules: slateType === 'showdown' ? showdownRules : [],
+                nflClassicRules: sport === 'nfl' && slateType === 'classic' ? nflClassicRules : [],
                 minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                 maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                 numLineups: appendCount,
@@ -2186,7 +2275,27 @@ export default function Optimizer() {
 
             // Append to existing valid lineups
             const existingValid = lineups.filter(l => l && l.some(p => p !== null))
-            const combined = [...existingValid, ...newLineups]
+
+            // Dedup new lineups against existing ones too
+            const existingKeys = new Set(
+                existingValid.map(lu =>
+                    lu.filter(Boolean)
+                        .map(p => p.SlatePlayerID)
+                        .sort()
+                        .join('-')
+                )
+            )
+            const dedupedNew = newLineups.filter(lu => {
+                const key = lu.filter(Boolean)
+                    .map(p => p.SlatePlayerID)
+                    .sort()
+                    .join('-')
+                if (existingKeys.has(key)) return false
+                existingKeys.add(key)
+                return true
+            })
+
+            const combined = [...existingValid, ...dedupedNew]
 
             setLineups(combined)
             setLineupSortBy('projected_desc')
@@ -2870,6 +2979,7 @@ export default function Optimizer() {
                     slateType,
                     isShowdown,
                     showdownRules: slateType === 'showdown' ? showdownRules : [],
+                    nflClassicRules: sport === 'nfl' && slateType === 'classic' ? nflClassicRules : [],
                     minSalary: teamSalaryMin ? parseInt(teamSalaryMin) : 49500,
                     maxSalary: teamSalaryMax ? parseInt(teamSalaryMax) : 50000,
                     numLineups: stack.lineupCount,
@@ -3091,6 +3201,7 @@ export default function Optimizer() {
                 legacyRules,
                 showdownRules,
                 showdownPoolMin,
+                nflClassicRules,
                 // Game filters
                 teamSalaryMin,
                 teamSalaryMax,
@@ -3151,6 +3262,7 @@ export default function Optimizer() {
                 if (settings.legacyRules) setLegacyRules(settings.legacyRules)
                 if (settings.showdownRules) setShowdownRules(settings.showdownRules)
                 if (settings.showdownPoolMin !== undefined) setShowdownPoolMin(settings.showdownPoolMin)
+                if (settings.nflClassicRules) setNflClassicRules(settings.nflClassicRules)
 
                 // Restore game filter rules
                 if (settings.teamSalaryMin) setTeamSalaryMin(settings.teamSalaryMin)
@@ -3557,9 +3669,9 @@ export default function Optimizer() {
                         {
                             label: 'Filters',
                             icon: '⚙️',
-                            active: !!(multiStackRules.length || pitcherPool.length || commonPool.length || legacyRules.excludedPlayers.length || (slateType === 'showdown' && showdownRules.length)),
+                            active: !!(multiStackRules.length || pitcherPool.length || commonPool.length || legacyRules.excludedPlayers.length || (slateType === 'showdown' && showdownRules.length) || (sport === 'nfl' && slateType === 'classic' && nflClassicRules.length)),
                             onClick: () => setShowGameFilters(true),
-                            badge: (multiStackRules.length + pitcherPool.length + commonPool.length + legacyRules.excludedPlayers.length + (slateType === 'showdown' ? showdownRules.length : 0)) || null,
+                            badge: (multiStackRules.length + pitcherPool.length + commonPool.length + legacyRules.excludedPlayers.length + (slateType === 'showdown' ? showdownRules.length : 0) + (sport === 'nfl' && slateType === 'classic' ? nflClassicRules.length : 0)) || null,
                         },
                         {
                             label: 'Notes',
@@ -6929,6 +7041,110 @@ export default function Optimizer() {
                                         </div>
                                     )}
 
+                                    {/* Classic NFL Rules */}
+                                    {sport === 'nfl' && slateType === 'classic' && (
+                                        <div className="pb-4 border-b border-[#223366]">
+                                            <div className="flex items-center justify-between mb-3">
+                                                <div>
+                                                    <div className="text-sm font-bold text-white">
+                                                        🏈 Classic NFL Rules
+                                                    </div>
+                                                    <div className="text-xs text-[#8A9BBE] mt-0.5">
+                                                        Select rules to enforce across all lineups
+                                                    </div>
+                                                </div>
+                                                <div className="flex gap-2">
+                                                    <button
+                                                        onClick={() => setNflClassicRules(NFL_CLASSIC_RULES.map(r => r.id))}
+                                                        className="text-xs text-[#8A9BBE] hover:text-[#FFB800] transition-colors">
+                                                        All
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setNflClassicRules([])}
+                                                        className="text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors">
+                                                        Clear
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            {['stack', 'ownership', 'construction'].map(cat => (
+                                                <div key={cat} className="mb-4">
+                                                    <div className="text-xs font-bold uppercase tracking-wider mb-2"
+                                                        style={{
+                                                            color: cat === 'stack' ? '#FFB800'
+                                                                : cat === 'ownership' ? '#818CF8'
+                                                                    : '#22C55E'
+                                                        }}>
+                                                        {cat === 'stack' ? '🔗 Stack & Correlation'
+                                                            : cat === 'ownership' ? '📊 Ownership & Leverage'
+                                                                : '🏗 Construction'}
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        {NFL_CLASSIC_RULES
+                                                            .filter(r => r.category === cat)
+                                                            .map(rule => {
+                                                                const isActive = nflClassicRules.includes(rule.id)
+                                                                const catColor = cat === 'stack'
+                                                                    ? '#FFB800'
+                                                                    : cat === 'ownership'
+                                                                        ? '#818CF8'
+                                                                        : '#22C55E'
+                                                                const catBg = cat === 'stack'
+                                                                    ? 'rgba(255,184,0,0.08)'
+                                                                    : cat === 'ownership'
+                                                                        ? 'rgba(99,102,241,0.08)'
+                                                                        : 'rgba(34,197,94,0.08)'
+
+                                                                return (
+                                                                    <button
+                                                                        key={rule.id}
+                                                                        onClick={() => toggleNflClassicRule(rule.id)}
+                                                                        className="w-full flex items-start gap-3 p-3 rounded-xl border text-left transition-all"
+                                                                        style={{
+                                                                            background: isActive ? catBg : '#0A1628',
+                                                                            borderColor: isActive ? catColor : '#223366'
+                                                                        }}>
+                                                                        <div className="w-5 h-5 rounded border-2 flex items-center justify-center shrink-0 mt-0.5"
+                                                                            style={{
+                                                                                borderColor: isActive ? catColor : '#223366',
+                                                                                background: isActive ? catColor : 'transparent'
+                                                                            }}>
+                                                                            {isActive && (
+                                                                                <span className="text-xs font-black" style={{ color: '#0A1628' }}>
+                                                                                    ✓
+                                                                                </span>
+                                                                            )}
+                                                                        </div>
+                                                                        <div className="flex-1 min-w-0">
+                                                                            <div className="text-xs font-bold"
+                                                                                style={{ color: isActive ? catColor : '#ffffff' }}>
+                                                                                {rule.label}
+                                                                            </div>
+                                                                            <div className="text-xs text-[#8A9BBE] mt-0.5">
+                                                                                {rule.description}
+                                                                            </div>
+                                                                        </div>
+                                                                    </button>
+                                                                )
+                                                            })}
+                                                    </div>
+                                                </div>
+                                            ))}
+
+                                            {nflClassicRules.length > 0 && (
+                                                <div className="p-3 rounded-xl border border-[#223366]"
+                                                    style={{ background: '#132244' }}>
+                                                    <div className="text-xs text-[#8A9BBE]">
+                                                        <span className="text-[#FFB800] font-bold">
+                                                            {nflClassicRules.length} rules active
+                                                        </span>
+                                                        {' '}— applied to every lineup
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
                                     <div className="pb-4 border-b border-[#223366]">
                                         <div className="flex items-center gap-2 mb-2">
                                             <div className="text-xs font-bold text-white">Unique Players per Lineup</div>
@@ -7115,6 +7331,9 @@ export default function Optimizer() {
                                             setPlayersPerGameMax(8)
                                             if (slateType === 'showdown') {
                                                 setShowdownRules([])
+                                            }
+                                            if (sport === 'nfl' && slateType === 'classic') {
+                                                setNflClassicRules([])
                                             }
                                         }}
                                         className="w-full text-xs text-[#8A9BBE] hover:text-[#EF4444] transition-colors pt-2">

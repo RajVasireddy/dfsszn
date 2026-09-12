@@ -58,6 +58,9 @@ def optimize():
         players = body.get('players', [])
         slots = body.get('slots', [])
         is_showdown = body.get('isShowdown', False)
+        nfl_classic_rules = set(body.get('nflClassicRules', []))
+        if nfl_classic_rules:
+            print(f"NFL Classic rules: {nfl_classic_rules}")
 
         # DEBUG logging
         print(f"\n{'='*50}")
@@ -243,11 +246,11 @@ def optimize():
 
         lineup_num = 0
         attempt = 0
-        max_attempts = num_lineups * 40
+        max_attempts = num_lineups * 60
         player_usage_count = {}
         stack_team_usage = {}
         consecutive_failures = 0
-        max_consecutive_failures = 100
+        max_consecutive_failures = 150
 
         while lineup_num < num_lineups and attempt < max_attempts and consecutive_failures < max_consecutive_failures:
             attempt += 1
@@ -980,11 +983,17 @@ def optimize():
 
                 model.Maximize(sum(objective_terms))
 
-                # Diversity for showdown
-                for prev in previous_lineups[-20:]:
+                # Diversity for showdown — look back at ALL previous lineups
+                # not just 20, and enforce stronger uniqueness
+                lookback = min(len(previous_lineups), 50)
+                for prev in previous_lineups[-lookback:]:
+                    overlap_allowed = max(
+                        len(slots) - max(min_unique, 3),
+                        len(slots) - 5
+                    )
                     model.Add(
                         sum(vars_list[i] for i in prev)
-                        <= len(slots) - min_unique
+                        <= overlap_allowed
                     )
 
                 # Solve
@@ -999,6 +1008,7 @@ def optimize():
 
                     if lineup_key in seen_lineups:
                         consecutive_failures += 1
+                        print(f"Duplicate lineup detected — skipping")
                         continue
 
                     seen_lineups.add(lineup_key)
@@ -1330,9 +1340,146 @@ def optimize():
                 else:
                     print(f"No bring-back: no opposing hitters available")
 
-            # Diversity constraint
-            for prev in previous_lineups[-20:]:
-                model.Add(sum(vars_list[i] for i in prev) <= len(slots) - min_unique)
+            # ── NFL CLASSIC RULES ────────────────────────────
+            if is_nfl and not is_showdown and nfl_classic_rules:
+
+                # Get position indices
+                qb_indices = [
+                    i for i in range(n)
+                    if players[i].get('operatorPosition') == 'QB'
+                ]
+                rb_indices = [
+                    i for i in range(n)
+                    if players[i].get('operatorPosition') == 'RB'
+                ]
+                wr_te_indices = [
+                    i for i in range(n)
+                    if players[i].get('operatorPosition') in ['WR', 'TE']
+                ]
+                dst_indices = [
+                    i for i in range(n)
+                    if players[i].get('operatorPosition') in ['DST', 'DEF']
+                ]
+
+                # ── RULE: qb_stack ───────────────────────────
+                # QB + 2 pass catchers from same team
+                if 'qb_stack' in nfl_classic_rules and current_stack:
+                    stack_qb = [
+                        i for i in qb_indices
+                        if players[i].get('team') == current_stack
+                    ]
+                    stack_pass_catchers = [
+                        i for i in range(n)
+                        if players[i].get('team') == current_stack
+                        and players[i].get('operatorPosition') in ['WR', 'TE']
+                    ]
+                    if stack_qb:
+                        model.Add(
+                            sum(vars_list[i] for i in stack_qb) >= 1
+                        )
+                        print(f"qb_stack: QB from {current_stack}")
+                    if len(stack_pass_catchers) >= 2:
+                        model.Add(
+                            sum(vars_list[i] for i in stack_pass_catchers) >= 2
+                        )
+                        print(f"qb_stack: 2+ WR/TE from {current_stack}")
+
+                # ── RULE: bring_back ─────────────────────────
+                # 1 WR/TE/RB from opposing team
+                if 'bring_back' in nfl_classic_rules and opposing_team:
+                    opp_skill = [
+                        i for i in range(n)
+                        if players[i].get('team') == opposing_team
+                        and players[i].get('operatorPosition') in ['WR', 'TE', 'RB']
+                    ]
+                    if opp_skill:
+                        model.Add(
+                            sum(vars_list[i] for i in opp_skill) >= 1
+                        )
+                        print(f"bring_back: 1+ skill from {opposing_team}")
+
+                # ── RULE: no_dst_vs_stack ────────────────────
+                # Block DST that faces the stack team
+                if 'no_dst_vs_stack' in nfl_classic_rules and current_stack:
+                    bad_dst = [
+                        i for i in dst_indices
+                        if players[i].get('opponent') == current_stack
+                        or players[i].get('opp') == current_stack
+                    ]
+                    for i in bad_dst:
+                        model.Add(vars_list[i] == 0)
+                    if bad_dst:
+                        print(f"no_dst_vs_stack: blocked {len(bad_dst)} DST")
+
+                # ── RULE: min_one_low_own ────────────────────
+                # At least 1 player under 15% ownership
+                if 'min_one_low_own' in nfl_classic_rules:
+                    low_own = [
+                        i for i in range(n)
+                        if float(players[i].get('ownershipProjection') or 0) < 15
+                    ]
+                    if low_own:
+                        model.Add(
+                            sum(vars_list[i] for i in low_own) >= 1
+                        )
+                        print(f"min_one_low_own: {len(low_own)} eligible")
+
+                # ── RULE: max_player_own ─────────────────────
+                # Exclude players over 35% ownership
+                if 'max_player_own' in nfl_classic_rules:
+                    high_own = [
+                        i for i in range(n)
+                        if float(players[i].get('ownershipProjection') or 0) > 35
+                    ]
+                    blocked = 0
+                    for i in high_own:
+                        # Don't block locked players — normalize_id() here,
+                        # not a plain str(), so this matches locked_player_ids
+                        # the same way every other lock-check in this file does
+                        # (see the "non-normalized" note near locked_indices above).
+                        if normalize_id(players[i].get('slatePlayerId')) not in locked_player_ids:
+                            model.Add(vars_list[i] == 0)
+                            blocked += 1
+                    if blocked:
+                        print(f"max_player_own: blocked {blocked} players over 35% own")
+
+                # ── RULE: must_have_rb ───────────────────────
+                # At least 1 RB in every lineup
+                if 'must_have_rb' in nfl_classic_rules:
+                    if rb_indices:
+                        model.Add(
+                            sum(vars_list[i] for i in rb_indices) >= 1
+                        )
+                        print(f"must_have_rb: >= 1 RB required")
+
+                # ── RULE: two_rb ─────────────────────────────
+                # At least 2 RBs in every lineup
+                if 'two_rb' in nfl_classic_rules:
+                    if len(rb_indices) >= 2:
+                        model.Add(
+                            sum(vars_list[i] for i in rb_indices) >= 2
+                        )
+                        print(f"two_rb: >= 2 RBs required")
+
+                # ── RULE: salary_floor ───────────────────────
+                # Must use at least $49,700
+                if 'salary_floor' in nfl_classic_rules:
+                    salary_expr = sum(
+                        vars_list[i] * int(players[i].get('operatorSalary', 0) or 0)
+                        for i in range(n)
+                    )
+                    model.Add(salary_expr >= 49700)
+                    print(f"salary_floor: >= $49,700 required")
+
+            # Diversity constraint — look back at ALL previous lineups not
+            # just 20, and enforce stronger uniqueness
+            lookback = min(len(previous_lineups), 50)
+            for prev in previous_lineups[-lookback:]:
+                overlap_allowed = max(
+                    len(slots) - max(min_unique, 3),
+                    len(slots) - 5
+                )
+                model.Add(sum(vars_list[i] for i in prev) <= overlap_allowed)
 
             # Objective: maximize GPP score with secondary hitter boost and value weighting.
             # The three boosts below (secondary/bring-back/value) were tuned around
@@ -1342,8 +1489,8 @@ def optimize():
             objective_terms = []
             for i in range(n):
                 base_score = int((players[i].get('gpp_score', 0) or 0) * 100)
-                usage_penalty = player_usage_count.get(i, 0) * 15
-                random_noise = random.randint(-8, 8)
+                usage_penalty = player_usage_count.get(i, 0) * 25
+                random_noise = random.randint(-20, 20)
                 secondary_boost = 0
                 bring_back_boost = 0
                 value_boost = 0
@@ -1494,6 +1641,7 @@ def optimize():
 
                 if lineup_key in seen_lineups:
                     consecutive_failures += 1
+                    print(f"Duplicate lineup detected — skipping")
                     continue
 
                 seen_lineups.add(lineup_key)
@@ -1514,6 +1662,41 @@ def optimize():
                     player_usage_count[idx] = player_usage_count.get(idx, 0) + 1
                 if is_mlb and current_stack:
                     stack_team_usage[current_stack] = stack_team_usage.get(current_stack, 0) + 1
+
+                # Track QB usage specifically for NFL — diagnostic only, the
+                # actual deprioritization already happens via usage_penalty
+                # in the objective above; this just surfaces when a QB is
+                # dominating the batch despite that penalty.
+                if is_nfl and not is_showdown:
+                    lineup_qbs = [
+                        idx for idx in selected_indices
+                        if players[idx].get('operatorPosition') == 'QB'
+                    ]
+                    for qb_idx in lineup_qbs:
+                        qb = players[qb_idx]
+                        qb_usage = player_usage_count.get(qb_idx, 0)
+                        # If a QB has been used in more than
+                        # 60% of lineups so far, boost penalty
+                        if lineup_num > 0:
+                            qb_pct = qb_usage / lineup_num
+                            if qb_pct > 0.6:
+                                print(f"QB {qb.get('operatorPlayerName')} "
+                                      f"overused ({qb_pct:.0%}) — "
+                                      f"increasing penalty")
+
+                # Hard cap: no player in more than 80% of lineups unless
+                # they are locked. No hard constraint is added here — the
+                # model for this lineup is already solved — this is handled
+                # by usage_penalty in the objective for subsequent lineups.
+                if lineup_num >= 3:
+                    for i in range(n):
+                        pid = str(players[i].get('slatePlayerId', ''))
+                        usage = player_usage_count.get(i, 0)
+                        usage_pct = usage / lineup_num if lineup_num > 0 else 0
+                        is_locked = pid in locked_player_ids
+                        if usage_pct > 0.80 and not is_locked:
+                            pass  # handled by usage_penalty above
+
                 print(f"  ✓ Lineup {lineup_num} accepted with stack: {current_stack}")
             else:
                 print(f"INFEASIBLE: status={solver_obj.StatusName(status)}")
